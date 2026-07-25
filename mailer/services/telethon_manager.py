@@ -124,8 +124,8 @@ class TelethonManager:
             account_id = existing["id"]
             await self.db.set_account_status(account_id, "active", error=None)
             await self.db.db.execute(
-                "UPDATE accounts SET label = ?, session_name = ? WHERE id = ?",
-                (label or name, session_name, account_id),
+                "UPDATE accounts SET label = ?, session_name = ?, added_by = COALESCE(added_by, ?) WHERE id = ?",
+                (label or name, session_name, admin_id, account_id),
             )
             await self.db.db.commit()
         else:
@@ -133,6 +133,7 @@ class TelethonManager:
                 phone=pending.phone,
                 session_name=session_name,
                 label=label or name,
+                added_by=admin_id,
             )
 
         # disconnect pending client; engine will reconnect by session file

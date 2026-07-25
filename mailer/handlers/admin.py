@@ -21,20 +21,35 @@ from mailer.states import (
     AddGroupStates,
     MessageStates,
     SettingsStates,
+    TeamStates,
 )
 
 log = logging.getLogger(__name__)
 router = Router(name="mailer_admin")
 
 
-def _is_admin(
+async def _is_allowed(
     event: Message | CallbackQuery,
     config: MailerConfig,
+    db: MailerDB | None = None,
 ) -> bool:
     user = event.from_user
     if not user:
         return False
-    return config.is_admin(user.id, user.username)
+    if config.is_admin(user.id, user.username):
+        return True
+    if db is not None and await db.is_operator(user.id):
+        return True
+    return False
+
+
+async def _touch_operator(event: Message | CallbackQuery, db: MailerDB) -> None:
+    """Remember who uses the bot (team list)."""
+    user = event.from_user
+    if not user:
+        return
+    name = " ".join(x for x in [user.first_name, user.last_name] if x) or ""
+    await db.upsert_operator(user.id, user.username or "", name)
 
 
 async def _deny(event: Message | CallbackQuery) -> None:
@@ -45,40 +60,40 @@ async def _deny(event: Message | CallbackQuery) -> None:
         f"⛔ Нет доступа.\n"
         f"Твой ID: <code>{uid}</code>\n"
         f"Username: {uname}\n\n"
-        f"Добавь в Railway Variables:\n"
-        f"<code>ADMIN_IDS={uid}</code>"
+        f"Попроси админа добавить тебя:\n"
+        f"Команда → Добавить по ID → <code>{uid}</code>\n"
+        f"или включи <code>MAILER_OPEN=true</code> на сервере."
     )
     log.warning("access denied user_id=%s username=%s", uid, uname)
     if isinstance(event, CallbackQuery):
-        # alerts don't render HTML well — plain text
-        await event.answer(
-            f"Нет доступа. Твой ID: {uid}. Добавь ADMIN_IDS={uid}",
-            show_alert=True,
-        )
+        await event.answer(f"Нет доступа. ID: {uid}", show_alert=True)
         if event.message:
             await event.message.answer(text, parse_mode="HTML")
     else:
         await event.answer(text, parse_mode="HTML")
 
 
-async def _main_text(db: MailerDB) -> str:
+async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
     st = await db.stats()
     cycle = await db.get_int("cycle_limit", 50)
     pause = await db.get_int("cycle_pause_sec", 3600)
     delay = await db.get_float("delay_sec", 8)
     log_id = await db.get_setting("log_group_id", "")
     mail = "🟢 ВКЛ" if st["mailing"] else "🔴 ВЫКЛ"
+    api_ok = "✅" if (config and config.telethon_ready) else "❌ нет TG_API_ID/HASH"
+    open_mode = "да (все с /start)" if (config and config.allow_all) else "нет (только команда)"
     return (
-        f"<b>Mailer — панель управления</b>\n\n"
+        f"<b>Mailer — панель</b>\n\n"
         f"Рассылка: <b>{mail}</b>\n"
         f"Аккаунты: {st['accounts']} (active {st['accounts_active']}, "
         f"cooldown {st['accounts_cooldown']})\n"
         f"Группы: {st['groups']}\n"
         f"Отправок OK/FAIL: {st['sends_ok']}/{st['sends_fail']}\n"
-        f"Круг: <b>{cycle}</b> сообщ. → пауза <b>{pause // 60}</b> мин\n"
-        f"Задержка: <b>{delay}</b> сек\n"
-        f"Лог-группа: <code>{log_id or 'не задана'}</code>\n\n"
-        f"Выбери раздел:"
+        f"Круг: <b>{cycle}</b> → пауза <b>{pause // 60}</b> мин · delay <b>{delay}</b>с\n"
+        f"Лог-группа: <code>{log_id or 'не задана'}</code>\n"
+        f"API: {api_ok}\n"
+        f"Открытый доступ: <b>{open_mode}</b>\n\n"
+        f"Товарищ сам: <b>➕ Добавить аккаунт</b> → номер → код с LZT → 2FA"
     )
 
 
@@ -87,13 +102,15 @@ async def _show_main(
     state: FSMContext | None,
     db: MailerDB,
     telethon: TelethonManager,
+    config: MailerConfig | None = None,
 ) -> None:
     if state:
         await state.clear()
     if isinstance(event, CallbackQuery) and event.from_user:
         await telethon.cancel_pending(event.from_user.id)
+    await _touch_operator(event, db)
     mailing = await db.is_mailing_enabled()
-    text = await _main_text(db)
+    text = await _main_text(db, config)
     markup = kb.main_menu(mailing)
     if isinstance(event, CallbackQuery) and event.message:
         await event.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -107,14 +124,14 @@ async def _show_main(
 
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
-    """Anyone can request their Telegram id (for ADMIN_IDS setup)."""
+    """Anyone can request their Telegram id."""
     user = message.from_user
     if not user:
         return
     await message.answer(
         f"Твой ID: <code>{user.id}</code>\n"
         f"Username: @{user.username or '—'}\n\n"
-        f"В Railway → Variables → <code>ADMIN_IDS={user.id}</code>",
+        f"Скинь ID админу → Команда → Добавить по ID",
         parse_mode="HTML",
     )
 
@@ -128,10 +145,10 @@ async def cmd_start(
     mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
-    await _show_main(message, state, mailer_db, mailer_telethon)
+    await _show_main(message, state, mailer_db, mailer_telethon, mailer_config)
 
 
 @router.callback_query(F.data == "menu:main")
@@ -142,10 +159,10 @@ async def cb_main(
     mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
-    await _show_main(call, state, mailer_db, mailer_telethon)
+    await _show_main(call, state, mailer_db, mailer_telethon, mailer_config)
 
 
 # ── status ────────────────────────────────────────────────────
@@ -157,7 +174,7 @@ async def cb_status(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     accounts = await mailer_db.list_accounts()
@@ -205,7 +222,7 @@ async def mail_start(
     mailer_db: MailerDB,
     mailer_engine: MailerEngine,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     accounts = [a for a in await mailer_db.list_accounts() if a["status"] != "disabled"]
@@ -246,7 +263,7 @@ async def mail_stop(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await mailer_db.set_mailing_enabled(False)
@@ -269,15 +286,16 @@ async def menu_accounts(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.clear()
     accounts = await mailer_db.list_accounts()
     text = (
         "<b>Аккаунты для рассылки</b>\n\n"
-        "Добавь телефон → код из Telegram → (2FA если есть).\n"
-        "Аккаунт должен иметь доступ к целевым группам."
+        "Любой из команды может добавить:\n"
+        "номер (LZT) → код с сайта по ключу → 2FA.\n"
+        "Аккаунт должен быть в целевых группах."
     )
     if call.message:
         await call.message.edit_text(
@@ -291,20 +309,31 @@ async def acc_add(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     if not mailer_config.telethon_ready:
         await call.answer(
-            "Задай TG_API_ID и TG_API_HASH (my.telegram.org)",
+            "Админ: задай TG_API_ID и TG_API_HASH на сервере (my.telegram.org)",
             show_alert=True,
         )
+        if call.message:
+            await call.message.answer(
+                "❌ Нельзя добавить аккаунт: на сервере нет <b>TG_API_ID / TG_API_HASH</b>.\n"
+                "Это один раз настраивает админ на Railway (не ключ с LZT).",
+                parse_mode="HTML",
+            )
         return
     await state.set_state(AddAccountStates.phone)
     if call.message:
         await call.message.edit_text(
-            "Отправь номер телефона аккаунта:\n<code>+79001234567</code>",
+            "<b>Шаг 1/3 — номер</b>\n\n"
+            "Пришли номер купленного аккаунта:\n"
+            "<code>+79001234567</code>\n\n"
+            "Ключ с LZT <b>в бота не кидай</b> — им смотри <b>код</b> в заказе на сайте, "
+            "когда бот попросит на шаге 2.",
             reply_markup=kb.cancel_kb(),
             parse_mode="HTML",
         )
@@ -316,9 +345,10 @@ async def acc_phone(
     message: Message,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     phone = (message.text or "").strip()
@@ -334,7 +364,10 @@ async def acc_phone(
         return
     await state.set_state(AddAccountStates.code)
     await message.answer(
-        f"{status}\n\nПришли <b>код</b> из Telegram (только цифры).",
+        f"{status}\n\n"
+        f"<b>Шаг 2/3 — код</b>\n"
+        f"Открой заказ на LZT → по ключу возьми код (или SMS/Telegram) → "
+        f"пришли сюда <b>только цифры кода</b>.",
         reply_markup=kb.cancel_kb(),
         parse_mode="HTML",
     )
@@ -345,9 +378,10 @@ async def acc_code(
     message: Message,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     try:
@@ -359,10 +393,18 @@ async def acc_code(
         return
     if need_pw:
         await state.set_state(AddAccountStates.password)
-        await message.answer(text, reply_markup=kb.cancel_kb())
+        await message.answer(
+            f"<b>Шаг 3/3 — 2FA</b>\n{text}\n\n"
+            f"Пришли облачный пароль (2FA), если продавец его дал.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
         return
     await state.clear()
-    await message.answer(text, reply_markup=kb.back_main())
+    await message.answer(
+        f"{text}\n\nДальше: Аккаунт → «Сообщение» и «Параметры», если нужно.",
+        reply_markup=kb.back_main(),
+    )
 
 
 @router.message(AddAccountStates.password)
@@ -370,9 +412,10 @@ async def acc_password(
     message: Message,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     try:
@@ -383,7 +426,10 @@ async def acc_password(
         await message.answer(f"Ошибка: {e}")
         return
     await state.clear()
-    await message.answer(text, reply_markup=kb.back_main())
+    await message.answer(
+        f"{text}\n\nАккаунт готов. Можно задать своё сообщение в карточке аккаунта.",
+        reply_markup=kb.back_main(),
+    )
 
 
 async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
@@ -432,7 +478,7 @@ async def acc_view(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -459,7 +505,7 @@ async def acc_msg_menu(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -485,8 +531,9 @@ async def acc_msg_edit(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -509,7 +556,7 @@ async def acc_msg_edit_text(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     data = await state.get_data()
@@ -532,7 +579,7 @@ async def acc_msg_clear(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -551,7 +598,7 @@ async def acc_params(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -574,8 +621,9 @@ async def acc_set_lim(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -598,7 +646,7 @@ async def acc_set_lim_val(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     data = await state.get_data()
@@ -623,8 +671,9 @@ async def acc_set_pause(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -647,7 +696,7 @@ async def acc_set_pause_val(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     data = await state.get_data()
@@ -672,8 +721,9 @@ async def acc_set_delay(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -696,7 +746,7 @@ async def acc_set_delay_val(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     data = await state.get_data()
@@ -722,7 +772,7 @@ async def acc_reset_params(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -740,7 +790,7 @@ async def acc_enable(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -756,7 +806,7 @@ async def acc_disable(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -774,7 +824,7 @@ async def acc_del(
     mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -794,7 +844,7 @@ async def menu_groups(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.clear()
@@ -818,8 +868,9 @@ async def grp_add(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.set_state(AddGroupStates.waiting)
@@ -840,7 +891,7 @@ async def grp_waiting(
     mailer_db: MailerDB,
     mailer_telethon: TelethonManager,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     chat_id: int | None = None
@@ -901,7 +952,7 @@ async def grp_view(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     gid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -931,7 +982,7 @@ async def grp_on(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     gid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -947,7 +998,7 @@ async def grp_off(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     gid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -964,7 +1015,7 @@ async def grp_del(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     gid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -983,7 +1034,7 @@ async def menu_messages(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.clear()
@@ -1011,7 +1062,7 @@ async def msg_view(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     mid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -1035,8 +1086,9 @@ async def msg_edit(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     mid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -1058,7 +1110,7 @@ async def msg_edit_text(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     data = await state.get_data()
@@ -1078,7 +1130,7 @@ async def msg_use(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     mid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
@@ -1093,8 +1145,9 @@ async def msg_new(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.set_state(MessageStates.new_title)
@@ -1111,8 +1164,9 @@ async def msg_new_title(
     message: Message,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     title = (message.text or "").strip()[:64] or "template"
@@ -1128,7 +1182,7 @@ async def msg_new_text(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     data = await state.get_data()
@@ -1152,7 +1206,7 @@ async def menu_settings(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.clear()
@@ -1179,8 +1233,9 @@ async def set_cycle_limit(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.set_state(SettingsStates.cycle_limit)
@@ -1199,7 +1254,7 @@ async def set_cycle_limit_val(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     try:
@@ -1219,8 +1274,9 @@ async def set_cycle_pause(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.set_state(SettingsStates.cycle_pause)
@@ -1240,7 +1296,7 @@ async def set_cycle_pause_val(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     try:
@@ -1263,8 +1319,9 @@ async def set_delay(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
+    mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.set_state(SettingsStates.delay)
@@ -1284,7 +1341,7 @@ async def set_delay_val(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     try:
@@ -1309,7 +1366,7 @@ async def menu_log(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(call, mailer_config):
+    if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
     await state.set_state(SettingsStates.log_group)
@@ -1336,7 +1393,7 @@ async def set_log_group(
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not _is_admin(message, mailer_config):
+    if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
     chat_id: int | None = None
@@ -1377,3 +1434,103 @@ async def set_log_group(
         reply_markup=kb.back_main(),
         parse_mode="HTML",
     )
+
+
+# ── team (operators) ──────────────────────────────────────────
+
+
+@router.callback_query(F.data == "menu:team")
+async def menu_team(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await state.clear()
+    ops = await mailer_db.list_operators()
+    mode = "открыт для всех (MAILER_OPEN)" if mailer_config.allow_all else "только список ниже + ADMIN_IDS"
+    lines = [
+        "<b>Команда</b>",
+        f"Режим доступа: <b>{mode}</b>",
+        "",
+        "Кто уже заходил в бота:",
+    ]
+    if not ops:
+        lines.append("— пока никого —")
+    else:
+        for op in ops:
+            un = f"@{op['username']}" if op.get("username") else op.get("full_name") or "—"
+            lines.append(f"• {un} — <code>{op['user_id']}</code>")
+    lines.append("\nДобавить вручную: ID человека (/id в боте).")
+    if call.message:
+        await call.message.edit_text(
+            "\n".join(lines),
+            reply_markup=kb.team_menu(ops),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "team:add")
+async def team_add(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await state.set_state(TeamStates.add_id)
+    if call.message:
+        await call.message.edit_text(
+            "Пришли <b>числовой Telegram ID</b> товарища.\n"
+            "Он может узнать ID командой /id в этом боте.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(TeamStates.add_id)
+async def team_add_id(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(message, mailer_config, mailer_db):
+        await _deny(message)
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Нужен числовой ID, например 123456789")
+        return
+    uid = int(raw)
+    await mailer_db.upsert_operator(uid, "", f"added_by_{message.from_user.id}")
+    await state.clear()
+    await message.answer(
+        f"✅ Пользователь <code>{uid}</code> в команде.\n"
+        f"Пусть нажмёт /start — сможет добавлять аккаунты.",
+        reply_markup=kb.back_main(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("team:del:"))
+async def team_del(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    uid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await mailer_db.remove_operator(uid)
+    await call.answer("Удалён из списка")
+    await menu_team(call, state, mailer_config, mailer_db)

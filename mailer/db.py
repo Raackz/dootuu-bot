@@ -86,6 +86,13 @@ class MailerDB:
             );
 
             CREATE INDEX IF NOT EXISTS idx_send_log_created ON send_log(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS operators (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                full_name TEXT NOT NULL DEFAULT '',
+                added_at REAL NOT NULL
+            );
             """
         )
         await self.db.commit()
@@ -94,6 +101,7 @@ class MailerDB:
         await self._ensure_column("accounts", "cycle_limit", "INTEGER")
         await self._ensure_column("accounts", "cycle_pause_sec", "INTEGER")
         await self._ensure_column("accounts", "delay_sec", "REAL")
+        await self._ensure_column("accounts", "added_by", "INTEGER")
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
@@ -161,15 +169,48 @@ class MailerDB:
 
     # ── accounts ──────────────────────────────────────────────
 
-    async def add_account(self, phone: str, session_name: str, label: str = "") -> int:
+    async def add_account(
+        self,
+        phone: str,
+        session_name: str,
+        label: str = "",
+        added_by: int | None = None,
+    ) -> int:
         now = time.time()
         cur = await self.db.execute(
-            "INSERT INTO accounts (phone, label, session_name, status, created_at) "
-            "VALUES (?, ?, ?, 'active', ?)",
-            (phone, label or phone, session_name, now),
+            "INSERT INTO accounts (phone, label, session_name, status, created_at, added_by) "
+            "VALUES (?, ?, ?, 'active', ?, ?)",
+            (phone, label or phone, session_name, now, added_by),
         )
         await self.db.commit()
         return int(cur.lastrowid)
+
+    # ── operators (team members who may use the bot) ───────────
+
+    async def upsert_operator(
+        self, user_id: int, username: str = "", full_name: str = ""
+    ) -> None:
+        await self.db.execute(
+            "INSERT INTO operators (user_id, username, full_name, added_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, "
+            "full_name = excluded.full_name",
+            (user_id, username or "", full_name or "", time.time()),
+        )
+        await self.db.commit()
+
+    async def remove_operator(self, user_id: int) -> None:
+        await self.db.execute("DELETE FROM operators WHERE user_id = ?", (user_id,))
+        await self.db.commit()
+
+    async def list_operators(self) -> list[dict[str, Any]]:
+        cur = await self.db.execute("SELECT * FROM operators ORDER BY added_at")
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def is_operator(self, user_id: int) -> bool:
+        cur = await self.db.execute(
+            "SELECT 1 FROM operators WHERE user_id = ?", (user_id,)
+        )
+        return (await cur.fetchone()) is not None
 
     async def list_accounts(self) -> list[dict[str, Any]]:
         cur = await self.db.execute("SELECT * FROM accounts ORDER BY id")

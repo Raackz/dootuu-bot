@@ -30,3 +30,7 @@ class AccountConfigStates(StatesGroup):
     cycle_limit = State()
     cycle_pause = State()
     delay = State()
+
+
+class TeamStates(StatesGroup):
+    add_id = State()

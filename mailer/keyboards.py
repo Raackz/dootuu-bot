@@ -4,11 +4,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def main_menu(mailing_on: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="➕ Добавить аккаунт (номер)",
+            callback_data="acc:add",
+        )
+    )
     b.row(InlineKeyboardButton(text="👤 Аккаунты", callback_data="menu:accounts"))
     b.row(InlineKeyboardButton(text="👥 Группы", callback_data="menu:groups"))
     b.row(InlineKeyboardButton(text="✉️ Сообщения", callback_data="menu:messages"))
     b.row(InlineKeyboardButton(text="⚙️ Настройки / цикл", callback_data="menu:settings"))
     b.row(InlineKeyboardButton(text="📋 Лог-группа", callback_data="menu:log"))
+    b.row(InlineKeyboardButton(text="🧑‍🤝‍🧑 Команда", callback_data="menu:team"))
     if mailing_on:
         b.row(InlineKeyboardButton(text="⏹ Стоп рассылки", callback_data="mail:stop"))
     else:
@@ -23,9 +30,24 @@ def back_main() -> InlineKeyboardMarkup:
     )
 
 
+def team_menu(operators: list[dict]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="➕ Добавить по ID", callback_data="team:add"))
+    for op in operators[:30]:
+        uname = op.get("username") or op.get("full_name") or str(op["user_id"])
+        b.row(
+            InlineKeyboardButton(
+                text=f"🗑 {uname[:24]} ({op['user_id']})",
+                callback_data=f"team:del:{op['user_id']}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Меню", callback_data="menu:main"))
+    return b.as_markup()
+
+
 def accounts_menu(accounts: list[dict]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="acc:add"))
+    b.row(InlineKeyboardButton(text="➕ Добавить аккаунт (номер + код)", callback_data="acc:add"))
     for a in accounts:
         st = a.get("status") or "?"
         icon = {"active": "🟢", "cooldown": "⏸", "error": "🔴", "disabled": "⚪"}.get(st, "•")

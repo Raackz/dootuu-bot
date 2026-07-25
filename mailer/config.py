@@ -25,6 +25,8 @@ class MailerConfig:
     default_cycle_limit: int = 50
     default_cycle_pause_sec: int = 3600
     default_delay_sec: float = 8.0
+    # If true — любой, кто открыл бота, может добавлять аккаунты и управлять
+    allow_all: bool = True
 
     def __post_init__(self) -> None:
         self.bot_token = (os.getenv("MAILER_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
@@ -34,6 +36,9 @@ class MailerConfig:
         self.admin_usernames = [
             x.strip().lstrip("@").lower() for x in raw_names.split(",") if x.strip()
         ]
+        # MAILER_OPEN=true|false — default true (team self-service)
+        open_raw = (os.getenv("MAILER_OPEN") or "true").strip().lower()
+        self.allow_all = open_raw in ("1", "true", "yes", "on")
         self.api_id = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
         self.api_hash = (os.getenv("TG_API_HASH") or os.getenv("API_HASH") or "").strip()
         self.data_dir = Path(os.getenv("DATA_DIR") or (BASE_DIR / "data" / "mailer"))
@@ -45,12 +50,20 @@ class MailerConfig:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    def is_admin(self, user_id: int | None, username: str | None = None) -> bool:
+    def is_env_admin(self, user_id: int | None, username: str | None = None) -> bool:
         if user_id is not None and user_id in self.admin_ids:
             return True
         if username and username.lstrip("@").lower() in self.admin_usernames:
             return True
-        # If no admins configured, allow everyone (dev convenience)
+        return False
+
+    def is_admin(self, user_id: int | None, username: str | None = None) -> bool:
+        """Backward-compatible: env admin OR open mode."""
+        if self.allow_all:
+            return True
+        if self.is_env_admin(user_id, username):
+            return True
+        # If no admins configured, allow everyone
         if not self.admin_ids and not self.admin_usernames:
             return True
         return False
