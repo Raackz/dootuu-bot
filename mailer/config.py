@@ -36,8 +36,8 @@ class MailerConfig:
         self.admin_usernames = [
             x.strip().lstrip("@").lower() for x in raw_names.split(",") if x.strip()
         ]
-        # MAILER_OPEN=true|false — default true (team self-service)
-        open_raw = (os.getenv("MAILER_OPEN") or "true").strip().lower()
+        # MAILER_OPEN=true|false — default false (only ADMIN_*)
+        open_raw = (os.getenv("MAILER_OPEN") or "false").strip().lower()
         self.allow_all = open_raw in ("1", "true", "yes", "on")
         self.api_id = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
         self.api_hash = (os.getenv("TG_API_HASH") or os.getenv("API_HASH") or "").strip()
@@ -58,14 +58,12 @@ class MailerConfig:
         return False
 
     def is_admin(self, user_id: int | None, username: str | None = None) -> bool:
-        """Backward-compatible: env admin OR open mode."""
+        """Env admin / allow_all. No silent open if admins are configured."""
         if self.allow_all:
             return True
         if self.is_env_admin(user_id, username):
             return True
-        # If no admins configured, allow everyone
-        if not self.admin_ids and not self.admin_usernames:
-            return True
+        # Only if nothing configured and open not forced — deny (safer)
         return False
 
     @property

@@ -33,14 +33,13 @@ async def _is_allowed(
     config: MailerConfig,
     db: MailerDB | None = None,
 ) -> bool:
+    """Only ADMIN_IDS / ADMIN_USERNAMES (or MAILER_OPEN=true)."""
     user = event.from_user
     if not user:
         return False
-    if config.is_admin(user.id, user.username):
-        return True
-    if db is not None and await db.is_operator(user.id):
-        return True
-    return False
+    # operators table is informational only — access = env admins
+    _ = db
+    return config.is_admin(user.id, user.username)
 
 
 async def _touch_operator(event: Message | CallbackQuery, db: MailerDB) -> None:
@@ -60,9 +59,7 @@ async def _deny(event: Message | CallbackQuery) -> None:
         f"⛔ Нет доступа.\n"
         f"Твой ID: <code>{uid}</code>\n"
         f"Username: {uname}\n\n"
-        f"Попроси админа добавить тебя:\n"
-        f"Команда → Добавить по ID → <code>{uid}</code>\n"
-        f"или включи <code>MAILER_OPEN=true</code> на сервере."
+        f"Доступ только у администратора."
     )
     log.warning("access denied user_id=%s username=%s", uid, uname)
     if isinstance(event, CallbackQuery):
