@@ -32,11 +32,27 @@ def _is_admin(
 
 
 async def _deny(event: Message | CallbackQuery) -> None:
-    text = "⛔ Нет доступа. Добавь свой ID в MAILER_ADMIN_IDS / ADMIN_IDS."
+    user = event.from_user
+    uid = user.id if user else "?"
+    uname = f"@{user.username}" if user and user.username else "—"
+    text = (
+        f"⛔ Нет доступа.\n"
+        f"Твой ID: <code>{uid}</code>\n"
+        f"Username: {uname}\n\n"
+        f"Добавь в Railway Variables:\n"
+        f"<code>ADMIN_IDS={uid}</code>"
+    )
+    log.warning("access denied user_id=%s username=%s", uid, uname)
     if isinstance(event, CallbackQuery):
-        await event.answer(text, show_alert=True)
+        # alerts don't render HTML well — plain text
+        await event.answer(
+            f"Нет доступа. Твой ID: {uid}. Добавь ADMIN_IDS={uid}",
+            show_alert=True,
+        )
+        if event.message:
+            await event.message.answer(text, parse_mode="HTML")
     else:
-        await event.answer(text)
+        await event.answer(text, parse_mode="HTML")
 
 
 async def _main_text(db: MailerDB) -> str:
@@ -81,6 +97,20 @@ async def _show_main(
 
 
 # ── entry ─────────────────────────────────────────────────────
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message) -> None:
+    """Anyone can request their Telegram id (for ADMIN_IDS setup)."""
+    user = message.from_user
+    if not user:
+        return
+    await message.answer(
+        f"Твой ID: <code>{user.id}</code>\n"
+        f"Username: @{user.username or '—'}\n\n"
+        f"В Railway → Variables → <code>ADMIN_IDS={user.id}</code>",
+        parse_mode="HTML",
+    )
 
 
 @router.message(CommandStart())
