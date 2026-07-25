@@ -39,11 +39,6 @@ async def _run() -> None:
     if not config.bot_token:
         log.error("MAILER_BOT_TOKEN or BOT_TOKEN is required")
         sys.exit(1)
-    if not config.telethon_ready:
-        log.warning(
-            "TG_API_ID / TG_API_HASH missing — account login will fail until set "
-            "(https://my.telegram.org)"
-        )
 
     db = MailerDB(config.db_path)
     await db.connect()
@@ -55,6 +50,18 @@ async def _run() -> None:
         await db.set_setting("cycle_pause_sec", str(config.default_cycle_pause_sec))
     if (await db.get_setting("delay_sec", "")) == "":
         await db.set_setting("delay_sec", str(config.default_delay_sec))
+
+    # API credentials: DB (set via bot) overrides env
+    db_api_id = (await db.get_setting("tg_api_id", "")).strip()
+    db_api_hash = (await db.get_setting("tg_api_hash", "")).strip()
+    if db_api_id or db_api_hash:
+        config.apply_api_from_values(db_api_id or None, db_api_hash or None)
+        log.info("Loaded TG API credentials from DB")
+    if not config.telethon_ready:
+        log.warning(
+            "TG API not set — admin can add via bot menu «🔑 API Telegram» "
+            "(https://my.telegram.org)"
+        )
 
     bot = Bot(
         token=config.bot_token,

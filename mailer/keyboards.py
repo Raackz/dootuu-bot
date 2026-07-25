@@ -13,6 +13,7 @@ def main_menu(mailing_on: bool = False) -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="👤 Аккаунты", callback_data="menu:accounts"))
     b.row(InlineKeyboardButton(text="👥 Группы", callback_data="menu:groups"))
     b.row(InlineKeyboardButton(text="✉️ Сообщения", callback_data="menu:messages"))
+    b.row(InlineKeyboardButton(text="🔑 API Telegram", callback_data="menu:api"))
     b.row(InlineKeyboardButton(text="⚙️ Настройки / цикл", callback_data="menu:settings"))
     b.row(InlineKeyboardButton(text="📋 Лог-группа", callback_data="menu:log"))
     b.row(InlineKeyboardButton(text="🧑‍🤝‍🧑 Команда", callback_data="menu:team"))
@@ -189,6 +190,22 @@ def settings_menu() -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="🔢 Лимит круга", callback_data="set:cycle_limit"))
     b.row(InlineKeyboardButton(text="⏱ Пауза между кругами", callback_data="set:cycle_pause"))
     b.row(InlineKeyboardButton(text="⏳ Задержка между сообщениями", callback_data="set:delay"))
+    b.row(InlineKeyboardButton(text="« Меню", callback_data="menu:main"))
+    return b.as_markup()
+
+
+def api_menu(ready: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="📝 Вставить api_id + api_hash одним сообщением",
+            callback_data="api:both",
+        )
+    )
+    b.row(InlineKeyboardButton(text="1️⃣ Задать api_id", callback_data="api:id"))
+    b.row(InlineKeyboardButton(text="2️⃣ Задать api_hash", callback_data="api:hash"))
+    if ready:
+        b.row(InlineKeyboardButton(text="🗑 Очистить API", callback_data="api:clear"))
     b.row(InlineKeyboardButton(text="« Меню", callback_data="menu:main"))
     return b.as_markup()
 

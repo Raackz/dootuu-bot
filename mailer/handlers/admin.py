@@ -80,7 +80,7 @@ async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
     delay = await db.get_float("delay_sec", 8)
     log_id = await db.get_setting("log_group_id", "")
     mail = "🟢 ВКЛ" if st["mailing"] else "🔴 ВЫКЛ"
-    api_ok = "✅" if (config and config.telethon_ready) else "❌ нет TG_API_ID/HASH"
+    api_ok = "✅ задан" if (config and config.telethon_ready) else "❌ не задан → «🔑 API Telegram»"
     open_mode = "да (все с /start)" if (config and config.allow_all) else "нет (только команда)"
     return (
         f"<b>Mailer — панель</b>\n\n"
@@ -93,7 +93,8 @@ async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
         f"Лог-группа: <code>{log_id or 'не задана'}</code>\n"
         f"API: {api_ok}\n"
         f"Открытый доступ: <b>{open_mode}</b>\n\n"
-        f"Товарищ сам: <b>➕ Добавить аккаунт</b> → номер → код с LZT → 2FA"
+        f"Админ: <b>🔑 API Telegram</b> (один раз)\n"
+        f"Команда: <b>➕ Добавить аккаунт</b> → номер → код"
     )
 
 
@@ -314,15 +315,19 @@ async def acc_add(
     if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
+    # refresh API from DB (admin may have set via bot)
+    db_id = (await mailer_db.get_setting("tg_api_id", "")).strip()
+    db_hash = (await mailer_db.get_setting("tg_api_hash", "")).strip()
+    if db_id or db_hash:
+        mailer_config.apply_api_from_values(db_id or None, db_hash or None)
     if not mailer_config.telethon_ready:
-        await call.answer(
-            "Админ: задай TG_API_ID и TG_API_HASH на сервере (my.telegram.org)",
-            show_alert=True,
-        )
+        await call.answer("Сначала задай API в меню «🔑 API Telegram»", show_alert=True)
         if call.message:
             await call.message.answer(
-                "❌ Нельзя добавить аккаунт: на сервере нет <b>TG_API_ID / TG_API_HASH</b>.\n"
-                "Это один раз настраивает админ на Railway (не ключ с LZT).",
+                "❌ Нет <b>api_id / api_hash</b>.\n"
+                "Админ: главное меню → <b>🔑 API Telegram</b> → вставить данные "
+                "с https://my.telegram.org\n"
+                "(это не ключ с LZT)",
                 parse_mode="HTML",
             )
         return
@@ -1534,3 +1539,236 @@ async def team_del(
     await mailer_db.remove_operator(uid)
     await call.answer("Удалён из списка")
     await menu_team(call, state, mailer_config, mailer_db)
+
+# ── API credentials (admin via bot) ───────────────────────────
+
+
+async def _api_status_text(mailer_db: MailerDB, mailer_config: MailerConfig) -> str:
+    db_id = (await mailer_db.get_setting("tg_api_id", "")).strip()
+    db_hash = (await mailer_db.get_setting("tg_api_hash", "")).strip()
+    if db_id.isdigit() and db_hash:
+        mailer_config.apply_api_from_values(db_id, db_hash)
+    ready = mailer_config.telethon_ready
+    hid = str(mailer_config.api_id) if mailer_config.api_id else "—"
+    hh = (mailer_config.api_hash[:6] + "…" + mailer_config.api_hash[-4:]) if mailer_config.api_hash and len(mailer_config.api_hash) > 12 else (mailer_config.api_hash or "—")
+    src = "БД (через бота)" if db_id and db_hash else ("env/Railway" if ready else "не задано")
+    return (
+        f"<b>🔑 API Telegram (Telethon)</b>\n\n"
+        f"Статус: <b>{'✅ готово' if ready else '❌ не задано'}</b>\n"
+        f"Источник: {src}\n"
+        f"api_id: <code>{hid}</code>\n"
+        f"api_hash: <code>{hh}</code>\n\n"
+        f"Взять на https://my.telegram.org → API development tools\n"
+        f"(один раз на весь бот, не ключ с LZT)\n\n"
+        f"Можно вставить одним сообщением:\n"
+        f"<code>12345678\nabcdef0123456789...</code>\n"
+        f"или <code>12345678:abcdef...</code>"
+    )
+
+
+@router.callback_query(F.data == "menu:api")
+async def menu_api(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await state.clear()
+    text = await _api_status_text(mailer_db, mailer_config)
+    if call.message:
+        await call.message.edit_text(
+            text,
+            reply_markup=kb.api_menu(mailer_config.telethon_ready),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "api:both")
+async def api_both(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await state.set_state(SettingsStates.api_both)
+    if call.message:
+        await call.message.edit_text(
+            "Пришли <b>api_id</b> и <b>api_hash</b> одним сообщением:\n\n"
+            "• две строки\n"
+            "• или <code>api_id:api_hash</code>\n"
+            "• или <code>api_id api_hash</code>\n\n"
+            "Пример:\n<code>28491234\na1b2c3d4e5f6789012345678abcdef01</code>",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(SettingsStates.api_both)
+async def api_both_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(message, mailer_config, mailer_db):
+        await _deny(message)
+        return
+    raw = (message.text or "").strip()
+    api_id = ""
+    api_hash = ""
+    if "\n" in raw:
+        parts = [p.strip() for p in raw.splitlines() if p.strip()]
+        if len(parts) >= 2:
+            api_id, api_hash = parts[0], parts[1]
+    elif ":" in raw:
+        api_id, api_hash = [p.strip() for p in raw.split(":", 1)]
+    else:
+        parts = raw.split()
+        if len(parts) >= 2:
+            api_id, api_hash = parts[0], parts[1]
+    if not api_id.isdigit() or len(api_hash) < 16:
+        await message.answer(
+            "Не распознал. Нужно число api_id и длинный api_hash.\n"
+            "Формат: две строки или id:hash"
+        )
+        return
+    await mailer_db.set_setting("tg_api_id", api_id)
+    await mailer_db.set_setting("tg_api_hash", api_hash)
+    mailer_config.set_api(int(api_id), api_hash)
+    await state.clear()
+    # try delete message with secrets
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await message.answer(
+        f"✅ API сохранены в боте.\n"
+        f"api_id: <code>{api_id}</code>\n"
+        f"Теперь можно: <b>➕ Добавить аккаунт</b>",
+        reply_markup=kb.back_main(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "api:id")
+async def api_id_btn(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await state.set_state(SettingsStates.api_id)
+    if call.message:
+        await call.message.edit_text(
+            "Пришли <b>api_id</b> (только число):",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(SettingsStates.api_id)
+async def api_id_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(message, mailer_config, mailer_db):
+        await _deny(message)
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("api_id должен быть числом")
+        return
+    await mailer_db.set_setting("tg_api_id", raw)
+    mailer_config.api_id = int(raw)
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await message.answer(
+        f"✅ api_id = <code>{raw}</code>\nТеперь задай api_hash (меню API → 2️⃣).",
+        reply_markup=kb.back_main(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "api:hash")
+async def api_hash_btn(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await state.set_state(SettingsStates.api_hash)
+    if call.message:
+        await call.message.edit_text(
+            "Пришли <b>api_hash</b> (строка с my.telegram.org):",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(SettingsStates.api_hash)
+async def api_hash_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(message, mailer_config, mailer_db):
+        await _deny(message)
+        return
+    raw = (message.text or "").strip()
+    if len(raw) < 16:
+        await message.answer("Слишком короткий api_hash")
+        return
+    await mailer_db.set_setting("tg_api_hash", raw)
+    mailer_config.api_hash = raw
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    ready = mailer_config.telethon_ready
+    await message.answer(
+        f"✅ api_hash сохранён.\n"
+        f"Статус API: <b>{'готово ✅' if ready else 'нужен ещё api_id'}</b>",
+        reply_markup=kb.back_main(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "api:clear")
+async def api_clear(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    await mailer_db.set_setting("tg_api_id", "")
+    await mailer_db.set_setting("tg_api_hash", "")
+    mailer_config.api_id = 0
+    mailer_config.api_hash = ""
+    await call.answer("Очищено")
+    await menu_api(call, state, mailer_config, mailer_db)

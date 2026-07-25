@@ -48,12 +48,22 @@ class TelethonManager:
     def session_path(self, session_name: str) -> Path:
         return self.config.sessions_dir / session_name
 
-    async def start_login(self, admin_id: int, phone: str) -> str:
-        """Send login code. Returns human status."""
+    async def _load_api(self) -> tuple[int, str]:
+        """Prefer DB-saved credentials, then env/config."""
+        db_id = (await self.db.get_setting("tg_api_id", "")).strip()
+        db_hash = (await self.db.get_setting("tg_api_hash", "")).strip()
+        if db_id.isdigit() and db_hash:
+            self.config.apply_api_from_values(db_id, db_hash)
         if not self.config.telethon_ready:
             raise RuntimeError(
-                "TG_API_ID / TG_API_HASH не заданы. Возьми на https://my.telegram.org"
+                "API не заданы. Админ: меню → 🔑 API Telegram → ввести api_id и api_hash "
+                "(https://my.telegram.org)"
             )
+        return self.config.api_id, self.config.api_hash
+
+    async def start_login(self, admin_id: int, phone: str) -> str:
+        """Send login code. Returns human status."""
+        api_id, api_hash = await self._load_api()
         phone = phone.strip().replace(" ", "")
         if not phone.startswith("+"):
             phone = "+" + phone
@@ -64,8 +74,8 @@ class TelethonManager:
         session_name = _safe_session_name(phone)
         client = TelegramClient(
             str(self.session_path(session_name)),
-            self.config.api_id,
-            self.config.api_hash,
+            api_id,
+            api_hash,
         )
         await client.connect()
         result = await client.send_code_request(phone)
@@ -164,10 +174,11 @@ class TelethonManager:
             acc = await self.db.get_account(account_id)
             if not acc:
                 raise RuntimeError(f"Account {account_id} not found")
+            api_id, api_hash = await self._load_api()
             client = TelegramClient(
                 str(self.session_path(acc["session_name"])),
-                self.config.api_id,
-                self.config.api_hash,
+                api_id,
+                api_hash,
             )
             await client.connect()
             if not await client.is_user_authorized():

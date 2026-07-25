@@ -23,6 +23,9 @@ class SettingsStates(StatesGroup):
     cycle_pause = State()
     delay = State()
     log_group = State()
+    api_id = State()
+    api_hash = State()
+    api_both = State()
 
 
 class AccountConfigStates(StatesGroup):

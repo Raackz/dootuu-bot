@@ -71,3 +71,15 @@ class MailerConfig:
     @property
     def telethon_ready(self) -> bool:
         return bool(self.api_id and self.api_hash)
+
+    def set_api(self, api_id: int, api_hash: str) -> None:
+        self.api_id = int(api_id)
+        self.api_hash = (api_hash or "").strip()
+
+    def apply_api_from_values(self, api_id: str | int | None, api_hash: str | None) -> bool:
+        """Apply non-empty credentials. Returns True if telethon becomes ready."""
+        if api_id is not None and str(api_id).strip().isdigit():
+            self.api_id = int(str(api_id).strip())
+        if api_hash is not None and str(api_hash).strip():
+            self.api_hash = str(api_hash).strip()
+        return self.telethon_ready
