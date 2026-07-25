@@ -244,8 +244,12 @@ async def mail_start(
             show_alert=True,
         )
         return
+    db_id = (await mailer_db.get_setting("tg_api_id", "")).strip()
+    db_hash = (await mailer_db.get_setting("tg_api_hash", "")).strip()
+    if db_id or db_hash:
+        mailer_config.apply_api_from_values(db_id or None, db_hash or None)
     if not mailer_config.telethon_ready:
-        await call.answer("Нет TG_API_ID / TG_API_HASH", show_alert=True)
+        await call.answer("Сначала «🔑 API Telegram»", show_alert=True)
         return
     await mailer_db.set_mailing_enabled(True)
     mailer_engine.start()
