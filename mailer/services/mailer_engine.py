@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 
 from aiogram import Bot
 
@@ -12,6 +13,24 @@ from mailer.db import MailerDB
 from mailer.services.telethon_manager import TelethonManager
 
 log = logging.getLogger(__name__)
+
+
+def _fmt_duration(sec: int) -> str:
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    parts: list[str] = []
+    if h:
+        parts.append(f"{h} ч")
+    if m or h:
+        parts.append(f"{m} мин")
+    if not h and not m:
+        parts.append(f"{s} сек")
+    return " ".join(parts)
+
+
+def _fmt_clock(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
 
 class MailerEngine:
@@ -68,16 +87,19 @@ class MailerEngine:
         if not accounts or not groups:
             return False, 3.0
 
-        # candidates: ready + have message text
         ready: list[dict] = []
         for acc in accounts:
             if acc["status"] in ("disabled", "error"):
                 continue
+            was_cooldown = acc["status"] == "cooldown"
             if not await self.db.maybe_end_cooldown(acc["id"]):
                 continue
             acc = await self.db.get_account(acc["id"])
             if not acc:
                 continue
+            # Новый круг после паузы
+            if was_cooldown and acc["status"] == "active":
+                await self._notify_cycle_started(acc)
             text = await self.db.account_message_text(acc)
             if not text:
                 continue
@@ -86,12 +108,10 @@ class MailerEngine:
         if not ready:
             return False, 3.0
 
-        # rotate accounts
         idx = self._account_rr % len(ready)
         account = ready[idx]
         self._account_rr = (idx + 1) % max(len(ready), 1)
 
-        # per-account group round-robin
         aid = int(account["id"])
         g_idx = self._group_rr.get(aid, 0) % len(groups)
         group = groups[g_idx]
@@ -120,24 +140,16 @@ class MailerEngine:
             await self._notify_log(
                 account=updated or account,
                 group=group,
-                status="✅ OK",
+                status="✅ Успешно",
                 preview=preview,
                 extra=None,
                 cycle_limit=cycle_limit,
             )
             if (updated or {}).get("status") == "cooldown":
-                pause = await self.db.account_cycle_pause(updated or account)
-                limit = await self.db.account_cycle_limit(updated or account)
-                await self._notify_log_raw(
-                    f"⏸ <b>Круг завершён</b>\n"
-                    f"Аккаунт: <b>{_esc(account.get('label') or account['phone'])}</b>\n"
-                    f"Отправлено в круге: {limit}\n"
-                    f"Пауза: {pause // 60} мин\n"
-                    f"Следующий круг: через {pause // 60} мин"
-                )
+                await self._notify_cycle_finished(updated or account)
             return True, delay
 
-        err = result.get("error") or "unknown"
+        err = result.get("error") or "неизвестная ошибка"
         await self.db.log_send(
             account_id=account["id"],
             group_id=group["id"],
@@ -154,18 +166,50 @@ class MailerEngine:
                 (time.time() + int(flood) + 5, err, account["id"]),
             )
             await self.db.db.commit()
+            await self._notify_log_raw(
+                f"⏳ <b>Пауза из‑за лимита Telegram</b>\n"
+                f"Аккаунт: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
+                f"Ждём: {_fmt_duration(int(flood) + 5)}\n"
+                f"Причина: <code>{_esc(err)}</code>"
+            )
         else:
             await self.db.set_account_status(account["id"], "active", error=err)
 
         await self._notify_log(
             account=account,
             group=group,
-            status="❌ FAIL",
+            status="❌ Ошибка",
             preview=preview,
             extra=err,
             cycle_limit=cycle_limit,
         )
         return True, delay
+
+    async def _notify_cycle_finished(self, account: dict) -> None:
+        pause = await self.db.account_cycle_pause(account)
+        limit = await self.db.account_cycle_limit(account)
+        next_at = account.get("next_cycle_at") or (time.time() + pause)
+        label = account.get("label") or account.get("phone") or "?"
+        text = (
+            f"⏹ <b>Круг рассылки завершён</b>\n\n"
+            f"Аккаунт: <b>{_esc(str(label))}</b>\n"
+            f"Отправлено сообщений в этом круге: <b>{limit}</b>\n"
+            f"Пауза до следующего круга: <b>{_fmt_duration(pause)}</b>\n"
+            f"Следующий круг примерно: <b>{_fmt_clock(float(next_at))}</b>\n\n"
+            f"Аккаунт на паузе, рассылка с него временно остановлена."
+        )
+        await self._notify_log_raw(text)
+
+    async def _notify_cycle_started(self, account: dict) -> None:
+        limit = await self.db.account_cycle_limit(account)
+        label = account.get("label") or account.get("phone") or "?"
+        text = (
+            f"▶️ <b>Новый круг рассылки начат</b>\n\n"
+            f"Аккаунт: <b>{_esc(str(label))}</b>\n"
+            f"Лимит сообщений в круге: <b>{limit}</b>\n"
+            f"Время: {_fmt_clock(time.time())}"
+        )
+        await self._notify_log_raw(text)
 
     async def _notify_log(
         self,
@@ -184,8 +228,8 @@ class MailerEngine:
             f"{status}\n"
             f"Аккаунт: <b>{_esc(label)}</b>\n"
             f"Группа: <b>{_esc(str(gtitle))}</b>\n"
-            f"<code>{group.get('chat_id')}</code>\n"
-            f"Круг: {sent}/{cycle_limit}\n"
+            f"ID чата: <code>{group.get('chat_id')}</code>\n"
+            f"Прогресс круга: <b>{sent}/{cycle_limit}</b>\n"
             f"Текст: {_esc(preview)}"
         )
         if extra:
@@ -195,6 +239,7 @@ class MailerEngine:
     async def _notify_log_raw(self, html: str) -> None:
         log_id = await self.db.get_setting("log_group_id", "")
         if not log_id:
+            log.info("cycle notify (no log group): %s", html[:200])
             return
         try:
             chat_id = int(log_id)
