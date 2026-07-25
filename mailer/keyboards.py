@@ -42,12 +42,72 @@ def accounts_menu(accounts: list[dict]) -> InlineKeyboardMarkup:
 
 def account_card(account_id: int, status: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="✉️ Сообщение аккаунта",
+            callback_data=f"acc:msg:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="⚙️ Параметры (круг / пауза / delay)",
+            callback_data=f"acc:params:{account_id}",
+        )
+    )
     if status == "disabled":
         b.row(InlineKeyboardButton(text="Включить", callback_data=f"acc:enable:{account_id}"))
     else:
         b.row(InlineKeyboardButton(text="Выключить", callback_data=f"acc:disable:{account_id}"))
     b.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"acc:del:{account_id}"))
     b.row(InlineKeyboardButton(text="« Аккаунты", callback_data="menu:accounts"))
+    return b.as_markup()
+
+
+def account_params_menu(account_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="🔢 Лимит круга",
+            callback_data=f"acc:setlim:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="⏱ Пауза после круга (мин)",
+            callback_data=f"acc:setpause:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="⏳ Задержка между сообщениями (сек)",
+            callback_data=f"acc:setdelay:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="♻️ Сбросить всё на глобальные",
+            callback_data=f"acc:resetparams:{account_id}",
+        )
+    )
+    b.row(InlineKeyboardButton(text="« Аккаунт", callback_data=f"acc:view:{account_id}"))
+    return b.as_markup()
+
+
+def account_msg_menu(account_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="✏️ Задать / изменить текст",
+            callback_data=f"acc:msgedit:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="🗑 Очистить (брать глобальный шаблон)",
+            callback_data=f"acc:msgclear:{account_id}",
+        )
+    )
+    b.row(InlineKeyboardButton(text="« Аккаунт", callback_data=f"acc:view:{account_id}"))
     return b.as_markup()
 
 

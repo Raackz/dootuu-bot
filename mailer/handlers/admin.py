@@ -15,7 +15,13 @@ from mailer.db import MailerDB
 from mailer import keyboards as kb
 from mailer.services.mailer_engine import MailerEngine
 from mailer.services.telethon_manager import TelethonManager
-from mailer.states import AddAccountStates, AddGroupStates, MessageStates, SettingsStates
+from mailer.states import (
+    AccountConfigStates,
+    AddAccountStates,
+    AddGroupStates,
+    MessageStates,
+    SettingsStates,
+)
 
 log = logging.getLogger(__name__)
 router = Router(name="mailer_admin")
@@ -158,15 +164,16 @@ async def cb_status(
     lines = [await _main_text(mailer_db), "", "<b>Аккаунты:</b>"]
     if not accounts:
         lines.append("— нет —")
-    limit = await mailer_db.get_int("cycle_limit", 50)
     for a in accounts:
         sent = a.get("sent_in_cycle") or 0
+        limit = await mailer_db.account_cycle_limit(a)
+        own = "✉" if (a.get("message_text") or "").strip() else "·"
         extra = ""
         if a["status"] == "cooldown" and a.get("next_cycle_at"):
             left = max(0, int(a["next_cycle_at"] - time.time()))
             extra = f", пауза ещё {left // 60}м {left % 60}с"
         lines.append(
-            f"• {a.get('label') or a['phone']}: <code>{a['status']}</code> "
+            f"• {own} {a.get('label') or a['phone']}: <code>{a['status']}</code> "
             f"({sent}/{limit}{extra})"
         )
     logs = await mailer_db.recent_logs(5)
@@ -203,15 +210,21 @@ async def mail_start(
         return
     accounts = [a for a in await mailer_db.list_accounts() if a["status"] != "disabled"]
     groups = await mailer_db.list_groups(only_active=True)
-    msg = await mailer_db.get_active_message()
     if not accounts:
         await call.answer("Сначала добавь аккаунт", show_alert=True)
         return
     if not groups:
         await call.answer("Сначала добавь группы", show_alert=True)
         return
-    if not msg or not (msg.get("text") or "").strip():
-        await call.answer("Задай текст сообщения", show_alert=True)
+    ready_msg = 0
+    for a in accounts:
+        if await mailer_db.account_message_text(a):
+            ready_msg += 1
+    if ready_msg == 0:
+        await call.answer(
+            "Нет текста: задай сообщение на аккаунте или глобальный шаблон",
+            show_alert=True,
+        )
         return
     if not mailer_config.telethon_ready:
         await call.answer("Нет TG_API_ID / TG_API_HASH", show_alert=True)
@@ -373,6 +386,46 @@ async def acc_password(
     await message.answer(text, reply_markup=kb.back_main())
 
 
+async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
+    limit = await mailer_db.account_cycle_limit(acc)
+    pause = await mailer_db.account_cycle_pause(acc)
+    delay = await mailer_db.account_delay(acc)
+    own_lim = acc.get("cycle_limit") is not None
+    own_pause = acc.get("cycle_pause_sec") is not None
+    own_delay = acc.get("delay_sec") is not None
+    msg = await mailer_db.account_message_text(acc)
+    own_msg = bool((acc.get("message_text") or "").strip())
+    preview = (msg[:120] + "…") if len(msg) > 120 else msg
+    if not preview:
+        preview = "— не задано —"
+    return (
+        f"<b>Аккаунт #{acc['id']}</b>\n"
+        f"Имя: {acc.get('label')}\n"
+        f"Телефон: <code>{acc['phone']}</code>\n"
+        f"Статус: <code>{acc['status']}</code>\n"
+        f"В круге: {acc.get('sent_in_cycle') or 0}/{limit}\n"
+        f"Ошибка: {acc.get('last_error') or '—'}\n\n"
+        f"<b>Сообщение</b> ({'своё' if own_msg else 'глобальный шаблон'}):\n"
+        f"<code>{_html_esc(preview)}</code>\n\n"
+        f"<b>Параметры</b>\n"
+        f"• Лимит круга: <b>{limit}</b>"
+        f"{'' if own_lim else ' <i>(глоб.)</i>'}\n"
+        f"• Пауза: <b>{pause // 60}</b> мин"
+        f"{'' if own_pause else ' <i>(глоб.)</i>'}\n"
+        f"• Delay: <b>{delay}</b> сек"
+        f"{'' if own_delay else ' <i>(глоб.)</i>'}"
+    )
+
+
+def _html_esc(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 @router.callback_query(F.data.startswith("acc:view:"))
 async def acc_view(
     call: CallbackQuery,
@@ -387,15 +440,7 @@ async def acc_view(
     if not acc:
         await call.answer("Не найден", show_alert=True)
         return
-    limit = await mailer_db.get_int("cycle_limit", 50)
-    text = (
-        f"<b>Аккаунт #{acc['id']}</b>\n"
-        f"Имя: {acc.get('label')}\n"
-        f"Телефон: <code>{acc['phone']}</code>\n"
-        f"Статус: <code>{acc['status']}</code>\n"
-        f"В круге: {acc.get('sent_in_cycle') or 0}/{limit}\n"
-        f"Ошибка: {acc.get('last_error') or '—'}"
-    )
+    text = await _fmt_acc_params(mailer_db, acc)
     if call.message:
         await call.message.edit_text(
             text,
@@ -403,6 +448,290 @@ async def acc_view(
             parse_mode="HTML",
         )
     await call.answer()
+
+
+# ── per-account message ───────────────────────────────────────
+
+
+@router.callback_query(F.data.startswith("acc:msg:"))
+async def acc_msg_menu(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    acc = await mailer_db.get_account(aid)
+    if not acc:
+        await call.answer("Не найден", show_alert=True)
+        return
+    own = (acc.get("message_text") or "").strip()
+    body = own if own else "(пусто — будет глобальный шаблон из «Сообщения»)"
+    if len(body) > 600:
+        body = body[:600] + "…"
+    if call.message:
+        await call.message.edit_text(
+            f"<b>Сообщение аккаунта #{aid}</b>\n\n{_html_esc(body)}",
+            reply_markup=kb.account_msg_menu(aid),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("acc:msgedit:"))
+async def acc_msg_edit(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(AccountConfigStates.message_text)
+    await state.update_data(account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Пришли <b>текст сообщения</b> только для аккаунта #{aid}.\n"
+            f"Он будет уходить из этого аккаунта вместо глобального шаблона.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(AccountConfigStates.message_text)
+async def acc_msg_edit_text(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(message, mailer_config):
+        await _deny(message)
+        return
+    data = await state.get_data()
+    aid = int(data["account_id"])
+    text = message.text or message.caption or ""
+    if not text.strip():
+        await message.answer("Пустой текст")
+        return
+    await mailer_db.set_account_message(aid, text)
+    await state.clear()
+    await message.answer(
+        f"✅ Сообщение для аккаунта #{aid} сохранено",
+        reply_markup=kb.back_main(),
+    )
+
+
+@router.callback_query(F.data.startswith("acc:msgclear:"))
+async def acc_msg_clear(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await mailer_db.set_account_message(aid, "")
+    await call.answer("Очищено — будет глобальный шаблон")
+    call.data = f"acc:msg:{aid}"
+    await acc_msg_menu(call, mailer_config, mailer_db)
+
+
+# ── per-account params ────────────────────────────────────────
+
+
+@router.callback_query(F.data.startswith("acc:params:"))
+async def acc_params(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    acc = await mailer_db.get_account(aid)
+    if not acc:
+        await call.answer("Не найден", show_alert=True)
+        return
+    if call.message:
+        await call.message.edit_text(
+            await _fmt_acc_params(mailer_db, acc)
+            + "\n\nВыбери что изменить (0 = сброс на глобальное):",
+            reply_markup=kb.account_params_menu(aid),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("acc:setlim:"))
+async def acc_set_lim(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(AccountConfigStates.cycle_limit)
+    await state.update_data(account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Лимит сообщений в круге для аккаунта #{aid}?\n"
+            f"Число, напр. <code>30</code>. Или <code>0</code> = глобальный.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(AccountConfigStates.cycle_limit)
+async def acc_set_lim_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(message, mailer_config):
+        await _deny(message)
+        return
+    data = await state.get_data()
+    aid = int(data["account_id"])
+    try:
+        n = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число")
+        return
+    if n <= 0:
+        await mailer_db.set_account_param(aid, cycle_limit=None)
+        msg = "Лимит сброшен на глобальный"
+    else:
+        await mailer_db.set_account_param(aid, cycle_limit=n)
+        msg = f"Лимит круга: {n}"
+    await state.clear()
+    await message.answer(f"✅ {msg}", reply_markup=kb.back_main())
+
+
+@router.callback_query(F.data.startswith("acc:setpause:"))
+async def acc_set_pause(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(AccountConfigStates.cycle_pause)
+    await state.update_data(account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Пауза после круга для аккаунта #{aid} в <b>минутах</b>?\n"
+            f"Напр. <code>60</code>. Или <code>0</code> = глобальная.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(AccountConfigStates.cycle_pause)
+async def acc_set_pause_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(message, mailer_config):
+        await _deny(message)
+        return
+    data = await state.get_data()
+    aid = int(data["account_id"])
+    try:
+        minutes = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число минут")
+        return
+    if minutes <= 0:
+        await mailer_db.set_account_param(aid, cycle_pause_sec=None)
+        msg = "Пауза сброшена на глобальную"
+    else:
+        await mailer_db.set_account_param(aid, cycle_pause_sec=minutes * 60)
+        msg = f"Пауза: {minutes} мин"
+    await state.clear()
+    await message.answer(f"✅ {msg}", reply_markup=kb.back_main())
+
+
+@router.callback_query(F.data.startswith("acc:setdelay:"))
+async def acc_set_delay(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(AccountConfigStates.delay)
+    await state.update_data(account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Задержка между сообщениями для аккаунта #{aid} в <b>секундах</b>?\n"
+            f"Напр. <code>10</code>. Или <code>0</code> = глобальная.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(AccountConfigStates.delay)
+async def acc_set_delay_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(message, mailer_config):
+        await _deny(message)
+        return
+    data = await state.get_data()
+    aid = int(data["account_id"])
+    try:
+        sec = float((message.text or "").strip().replace(",", "."))
+    except ValueError:
+        await message.answer("Нужно число секунд")
+        return
+    if sec <= 0:
+        await mailer_db.set_account_param(aid, delay_sec=None)
+        msg = "Delay сброшен на глобальный"
+    else:
+        await mailer_db.set_account_param(aid, delay_sec=sec)
+        msg = f"Delay: {sec} сек"
+    await state.clear()
+    await message.answer(f"✅ {msg}", reply_markup=kb.back_main())
+
+
+@router.callback_query(F.data.startswith("acc:resetparams:"))
+async def acc_reset_params(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not _is_admin(call, mailer_config):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await mailer_db.set_account_param(
+        aid, cycle_limit=None, cycle_pause_sec=None, delay_sec=None
+    )
+    await call.answer("Параметры сброшены")
+    call.data = f"acc:params:{aid}"
+    await acc_params(call, mailer_config, mailer_db)
 
 
 @router.callback_query(F.data.startswith("acc:enable:"))
@@ -662,9 +991,10 @@ async def menu_messages(
     active = await mailer_db.get_active_message()
     active_id = active["id"] if active else None
     text = (
-        "<b>Шаблоны сообщений</b>\n\n"
-        "Активный шаблон уходит во все группы.\n"
-        f"Сейчас: <b>{(active or {}).get('title') or '—'}</b>"
+        "<b>Глобальные шаблоны сообщений</b>\n\n"
+        "Используются, если у аккаунта <b>нет своего</b> текста.\n"
+        "Своё сообщение: Аккаунты → аккаунт → «Сообщение аккаунта».\n"
+        f"Активный глобальный: <b>{(active or {}).get('title') or '—'}</b>"
     )
     if call.message:
         await call.message.edit_text(

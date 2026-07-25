@@ -5,15 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
 
 from aiogram import Bot
 
 from mailer.db import MailerDB
 from mailer.services.telethon_manager import TelethonManager
-
-if TYPE_CHECKING:
-    pass
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +26,8 @@ class MailerEngine:
         self.bot = bot
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
-        self._group_rr: int = 0  # round-robin index
+        self._group_rr: dict[int, int] = {}  # account_id -> rr index
+        self._account_rr: int = 0
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -56,8 +53,7 @@ class MailerEngine:
                 if not await self.db.is_mailing_enabled():
                     await asyncio.sleep(2)
                     continue
-                did_work = await self._tick()
-                delay = await self.db.get_float("delay_sec", 8.0)
+                did_work, delay = await self._tick()
                 await asyncio.sleep(delay if did_work else 3.0)
             except asyncio.CancelledError:
                 raise
@@ -65,37 +61,46 @@ class MailerEngine:
                 log.exception("mailer loop error")
                 await asyncio.sleep(5)
 
-    async def _tick(self) -> bool:
-        """One send attempt. Returns True if a send was tried."""
+    async def _tick(self) -> tuple[bool, float]:
+        """One send attempt. Returns (did_work, sleep_seconds)."""
         accounts = await self.db.list_accounts()
         groups = await self.db.list_groups(only_active=True)
-        msg = await self.db.get_active_message()
+        if not accounts or not groups:
+            return False, 3.0
 
-        if not accounts or not groups or not msg or not (msg.get("text") or "").strip():
-            return False
-
-        # pick first ready account
-        account = None
+        # candidates: ready + have message text
+        ready: list[dict] = []
         for acc in accounts:
             if acc["status"] in ("disabled", "error"):
                 continue
-            ready = await self.db.maybe_end_cooldown(acc["id"])
-            if ready:
-                account = await self.db.get_account(acc["id"])
-                break
-            # still in cooldown — skip
-        if not account:
-            return False
+            if not await self.db.maybe_end_cooldown(acc["id"]):
+                continue
+            acc = await self.db.get_account(acc["id"])
+            if not acc:
+                continue
+            text = await self.db.account_message_text(acc)
+            if not text:
+                continue
+            ready.append(acc)
 
-        # round-robin group
-        groups = await self.db.list_groups(only_active=True)
-        if not groups:
-            return False
-        idx = self._group_rr % len(groups)
-        group = groups[idx]
-        self._group_rr = (idx + 1) % len(groups)
+        if not ready:
+            return False, 3.0
 
-        text = msg["text"]
+        # rotate accounts
+        idx = self._account_rr % len(ready)
+        account = ready[idx]
+        self._account_rr = (idx + 1) % max(len(ready), 1)
+
+        # per-account group round-robin
+        aid = int(account["id"])
+        g_idx = self._group_rr.get(aid, 0) % len(groups)
+        group = groups[g_idx]
+        self._group_rr[aid] = (g_idx + 1) % len(groups)
+
+        text = await self.db.account_message_text(account)
+        delay = await self.db.account_delay(account)
+        cycle_limit = await self.db.account_cycle_limit(account)
+
         result = await self.telethon.send_to_group(
             account["id"], int(group["chat_id"]), text
         )
@@ -118,18 +123,19 @@ class MailerEngine:
                 status="✅ OK",
                 preview=preview,
                 extra=None,
+                cycle_limit=cycle_limit,
             )
             if (updated or {}).get("status") == "cooldown":
-                pause = await self.db.get_int("cycle_pause_sec", 3600)
-                limit = await self.db.get_int("cycle_limit", 50)
+                pause = await self.db.account_cycle_pause(updated or account)
+                limit = await self.db.account_cycle_limit(updated or account)
                 await self._notify_log_raw(
                     f"⏸ <b>Круг завершён</b>\n"
-                    f"Аккаунт: <b>{account.get('label') or account['phone']}</b>\n"
+                    f"Аккаунт: <b>{_esc(account.get('label') or account['phone'])}</b>\n"
                     f"Отправлено в круге: {limit}\n"
                     f"Пауза: {pause // 60} мин\n"
                     f"Следующий круг: через {pause // 60} мин"
                 )
-            return True
+            return True, delay
 
         err = result.get("error") or "unknown"
         await self.db.log_send(
@@ -143,7 +149,6 @@ class MailerEngine:
         )
         flood = result.get("flood_wait")
         if flood:
-            # soft cooldown on flood
             await self.db.db.execute(
                 "UPDATE accounts SET status = 'cooldown', next_cycle_at = ?, last_error = ? WHERE id = ?",
                 (time.time() + int(flood) + 5, err, account["id"]),
@@ -158,8 +163,9 @@ class MailerEngine:
             status="❌ FAIL",
             preview=preview,
             extra=err,
+            cycle_limit=cycle_limit,
         )
-        return True
+        return True, delay
 
     async def _notify_log(
         self,
@@ -169,10 +175,10 @@ class MailerEngine:
         status: str,
         preview: str,
         extra: str | None,
+        cycle_limit: int,
     ) -> None:
         label = account.get("label") or account.get("phone") or "?"
         gtitle = group.get("title") or group.get("chat_id")
-        cycle_limit = await self.db.get_int("cycle_limit", 50)
         sent = int(account.get("sent_in_cycle") or 0)
         text = (
             f"{status}\n"

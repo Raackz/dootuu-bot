@@ -23,3 +23,10 @@ class SettingsStates(StatesGroup):
     cycle_pause = State()
     delay = State()
     log_group = State()
+
+
+class AccountConfigStates(StatesGroup):
+    message_text = State()
+    cycle_limit = State()
+    cycle_pause = State()
+    delay = State()

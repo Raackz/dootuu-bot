@@ -89,6 +89,11 @@ class MailerDB:
             """
         )
         await self.db.commit()
+        # per-account message + params (nullable = use global defaults)
+        await self._ensure_column("accounts", "message_text", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("accounts", "cycle_limit", "INTEGER")
+        await self._ensure_column("accounts", "cycle_pause_sec", "INTEGER")
+        await self._ensure_column("accounts", "delay_sec", "REAL")
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
@@ -113,6 +118,13 @@ class MailerDB:
                 ("default", "Привет! 👋", now, now),
             )
         await self.db.commit()
+
+    async def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        cur = await self.db.execute(f"PRAGMA table_info({table})")
+        cols = {row[1] for row in await cur.fetchall()}
+        if column not in cols:
+            await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            await self.db.commit()
 
     # ── settings ──────────────────────────────────────────────
 
@@ -185,18 +197,90 @@ class MailerDB:
         await self.db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         await self.db.commit()
 
+    async def set_account_message(self, account_id: int, text: str) -> None:
+        await self.db.execute(
+            "UPDATE accounts SET message_text = ? WHERE id = ?",
+            (text or "", account_id),
+        )
+        await self.db.commit()
+
+    async def set_account_param(
+        self,
+        account_id: int,
+        *,
+        cycle_limit: int | None = ...,  # type: ignore[assignment]
+        cycle_pause_sec: int | None = ...,  # type: ignore[assignment]
+        delay_sec: float | None = ...,  # type: ignore[assignment]
+    ) -> None:
+        """Update per-account params. Pass None to reset to global. Omit to leave unchanged."""
+        acc = await self.get_account(account_id)
+        if not acc:
+            return
+        fields: list[str] = []
+        vals: list[Any] = []
+        if cycle_limit is not ...:
+            fields.append("cycle_limit = ?")
+            vals.append(cycle_limit)
+        if cycle_pause_sec is not ...:
+            fields.append("cycle_pause_sec = ?")
+            vals.append(cycle_pause_sec)
+        if delay_sec is not ...:
+            fields.append("delay_sec = ?")
+            vals.append(delay_sec)
+        if not fields:
+            return
+        vals.append(account_id)
+        await self.db.execute(
+            f"UPDATE accounts SET {', '.join(fields)} WHERE id = ?",
+            vals,
+        )
+        await self.db.commit()
+
+    async def account_message_text(self, account: dict[str, Any]) -> str:
+        """Own message if set, otherwise global active template."""
+        own = (account.get("message_text") or "").strip()
+        if own:
+            return own
+        msg = await self.get_active_message()
+        return ((msg or {}).get("text") or "").strip()
+
+    async def account_cycle_limit(self, account: dict[str, Any]) -> int:
+        v = account.get("cycle_limit")
+        if v is not None and str(v).strip() != "":
+            try:
+                return max(1, int(v))
+            except (TypeError, ValueError):
+                pass
+        return await self.get_int("cycle_limit", 50)
+
+    async def account_cycle_pause(self, account: dict[str, Any]) -> int:
+        v = account.get("cycle_pause_sec")
+        if v is not None and str(v).strip() != "":
+            try:
+                return max(60, int(v))
+            except (TypeError, ValueError):
+                pass
+        return await self.get_int("cycle_pause_sec", 3600)
+
+    async def account_delay(self, account: dict[str, Any]) -> float:
+        v = account.get("delay_sec")
+        if v is not None and str(v).strip() != "":
+            try:
+                return max(1.0, float(v))
+            except (TypeError, ValueError):
+                pass
+        return await self.get_float("delay_sec", 8.0)
+
     async def mark_sent(self, account_id: int) -> dict[str, Any]:
         """Increment cycle counter; if limit reached — schedule next cycle."""
         acc = await self.get_account(account_id)
         if not acc:
             return {}
-        cycle_limit = await self.get_int("cycle_limit", 50)
-        pause = await self.get_int("cycle_pause_sec", 3600)
+        cycle_limit = await self.account_cycle_limit(acc)
+        pause = await self.account_cycle_pause(acc)
         now = time.time()
         sent = int(acc["sent_in_cycle"] or 0) + 1
         cycle_started = acc["cycle_started_at"] or now
-        next_cycle_at = acc["next_cycle_at"]
-        status = acc["status"]
 
         if sent >= cycle_limit:
             next_cycle_at = now + pause
