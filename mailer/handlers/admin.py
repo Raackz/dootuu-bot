@@ -19,6 +19,8 @@ from mailer.states import (
     AccountConfigStates,
     AddAccountStates,
     AddGroupStates,
+    AddLogGroupStates,
+    ClientLabelStates,
     MessageStates,
     SettingsStates,
     TeamStates,
@@ -75,23 +77,22 @@ async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
     cycle = await db.get_int("cycle_limit", 50)
     pause = await db.get_int("cycle_pause_sec", 3600)
     delay = await db.get_float("delay_sec", 8)
-    log_id = await db.get_setting("log_group_id", "")
+    logs_n = len(await db.list_log_groups(only_active=True))
     mail = "🟢 ВКЛ" if st["mailing"] else "🔴 ВЫКЛ"
     api_ok = "✅ задан" if (config and config.telethon_ready) else "❌ не задан → «🔑 API Telegram»"
-    open_mode = "да (все с /start)" if (config and config.allow_all) else "нет (только команда)"
+    open_mode = "да" if (config and config.allow_all) else "только админ"
     return (
         f"<b>Mailer — панель</b>\n\n"
         f"Рассылка: <b>{mail}</b>\n"
-        f"Аккаунты: {st['accounts']} (active {st['accounts_active']}, "
-        f"cooldown {st['accounts_cooldown']})\n"
-        f"Группы: {st['groups']}\n"
+        f"Аккаунты (клиенты): {st['accounts']} "
+        f"(active {st['accounts_active']}, cooldown {st['accounts_cooldown']})\n"
+        f"Групп в пуле: {st['groups']} · лог-групп: {logs_n}\n"
         f"Отправок OK/FAIL: {st['sends_ok']}/{st['sends_fail']}\n"
-        f"Круг: <b>{cycle}</b> → пауза <b>{pause // 60}</b> мин · delay <b>{delay}</b>с\n"
-        f"Лог-группа: <code>{log_id or 'не задана'}</code>\n"
+        f"Круг (глоб.): <b>{cycle}</b> · пауза <b>{pause // 60}</b> мин · delay <b>{delay}</b>с\n"
         f"API: {api_ok}\n"
-        f"Открытый доступ: <b>{open_mode}</b>\n\n"
-        f"Админ: <b>🔑 API Telegram</b> (один раз)\n"
-        f"Команда: <b>➕ Добавить аккаунт</b> → номер → код"
+        f"Доступ: <b>{open_mode}</b>\n\n"
+        f"Каждый аккаунт = отдельный клиент:\n"
+        f"своё сообщение, свои группы, свои логи."
     )
 
 
@@ -224,20 +225,18 @@ async def mail_start(
         await _deny(call)
         return
     accounts = [a for a in await mailer_db.list_accounts() if a["status"] != "disabled"]
-    groups = await mailer_db.list_groups(only_active=True)
     if not accounts:
         await call.answer("Сначала добавь аккаунт", show_alert=True)
         return
-    if not groups:
-        await call.answer("Сначала добавь группы", show_alert=True)
-        return
-    ready_msg = 0
+    ready = 0
     for a in accounts:
-        if await mailer_db.account_message_text(a):
-            ready_msg += 1
-    if ready_msg == 0:
+        text = await mailer_db.account_message_text(a)
+        grps = await mailer_db.list_account_groups(a["id"], only_active=True)
+        if text and grps:
+            ready += 1
+    if ready == 0:
         await call.answer(
-            "Нет текста: задай сообщение на аккаунте или глобальный шаблон",
+            "Нет готовых аккаунтов: у каждого нужны своё сообщение + группы рассылки",
             show_alert=True,
         )
         return
@@ -450,12 +449,17 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
     preview = (msg[:120] + "…") if len(msg) > 120 else msg
     if not preview:
         preview = "— не задано —"
+    grps = await mailer_db.list_account_groups(acc["id"], only_active=True)
+    logs = await mailer_db.list_account_log_groups(acc["id"])
+    client = (acc.get("client_label") or "").strip() or "—"
     return (
-        f"<b>Аккаунт #{acc['id']}</b>\n"
+        f"<b>Аккаунт #{acc['id']}</b> (отдельный клиент)\n"
+        f"Клиент: <b>{_html_esc(client)}</b>\n"
         f"Имя: {acc.get('label')}\n"
         f"Телефон: <code>{acc['phone']}</code>\n"
         f"Статус: <code>{acc['status']}</code>\n"
         f"В круге: {acc.get('sent_in_cycle') or 0}/{limit}\n"
+        f"Групп рассылки: <b>{len(grps)}</b> · лог-групп: <b>{len(logs)}</b>\n"
         f"Ошибка: {acc.get('last_error') or '—'}\n\n"
         f"<b>Сообщение</b> ({'своё' if own_msg else 'глобальный шаблон'}):\n"
         f"<code>{_html_esc(preview)}</code>\n\n"
@@ -890,6 +894,7 @@ async def grp_add(
 
 
 @router.message(AddGroupStates.waiting)
+@router.message(AddGroupStates.for_account)
 async def grp_waiting(
     message: Message,
     state: FSMContext,
@@ -900,6 +905,8 @@ async def grp_waiting(
     if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
+    data = await state.get_data()
+    link_aid = data.get("link_account_id")
     chat_id: int | None = None
     title = ""
     username = ""
@@ -918,6 +925,10 @@ async def grp_waiting(
         ref = message.text.strip()
         accounts = await mailer_db.list_accounts()
         active = [a for a in accounts if a["status"] in ("active", "cooldown")]
+        if link_aid:
+            acc = await mailer_db.get_account(int(link_aid))
+            if acc:
+                active = [acc] + [a for a in active if a["id"] != acc["id"]]
         if not active:
             await message.answer(
                 "Нет аккаунтов. Сначала добавь аккаунт, потом группу по ссылке.\n"
@@ -942,11 +953,15 @@ async def grp_waiting(
         return
 
     gid = await mailer_db.add_group(chat_id, title=title, username=username)
+    extra = ""
+    if link_aid:
+        await mailer_db.link_account_group(int(link_aid), gid)
+        extra = f"\nПривязана к аккаунту #{link_aid}"
     await state.clear()
     await message.answer(
         f"✅ Группа добавлена\n"
         f"#{gid} <b>{title or chat_id}</b>\n"
-        f"<code>{chat_id}</code>",
+        f"<code>{chat_id}</code>{extra}",
         reply_markup=kb.back_main(),
         parse_mode="HTML",
     )
@@ -1362,11 +1377,11 @@ async def set_delay_val(
     await message.answer(f"✅ Задержка: {sec} сек", reply_markup=kb.back_main())
 
 
-# ── log group ─────────────────────────────────────────────────
+# ── multi log groups pool ─────────────────────────────────────
 
 
-@router.callback_query(F.data == "menu:log")
-async def menu_log(
+@router.callback_query(F.data == "menu:logs")
+async def menu_logs(
     call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
@@ -1375,33 +1390,43 @@ async def menu_log(
     if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
-    await state.set_state(SettingsStates.log_group)
-    log_id = await mailer_db.get_setting("log_group_id", "")
+    await state.clear()
+    logs = await mailer_db.list_log_groups()
     if call.message:
         await call.message.edit_text(
-            f"<b>Лог-группа</b>\n\n"
-            f"Сейчас: <code>{log_id or 'не задана'}</code>\n\n"
-            f"1. Создай группу\n"
-            f"2. Добавь <b>этого бота</b> админом (чтобы писал логи)\n"
-            f"3. Перешли сюда любое сообщение из лог-группы "
-            f"или пришли chat_id\n\n"
-            f"Туда: куда ушло, с какого аккаунта, статус, прогресс круга.",
-            reply_markup=kb.cancel_kb(),
+            "<b>Пул лог-групп</b>\n\n"
+            "Можно много лог-групп. Потом в карточке аккаунта "
+            "отметь, какие логи слушают <b>этого</b> клиента.\n\n"
+            "1. Создай группу в Telegram\n"
+            "2. Добавь <b>этого бота</b> админом\n"
+            "3. Добавь группу сюда (forward / chat_id)",
+            reply_markup=kb.log_groups_pool_menu(logs),
             parse_mode="HTML",
         )
     await call.answer()
 
 
-@router.message(SettingsStates.log_group)
-async def set_log_group(
-    message: Message,
+@router.callback_query(F.data == "log:add")
+async def log_add(
+    call: CallbackQuery,
     state: FSMContext,
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
 ) -> None:
-    if not await _is_allowed(message, mailer_config, mailer_db):
-        await _deny(message)
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
         return
+    await state.set_state(AddLogGroupStates.waiting)
+    await state.update_data(link_account_id=None)
+    if call.message:
+        await call.message.edit_text(
+            "Перешли сообщение из лог-группы или пришли chat_id.",
+            reply_markup=kb.cancel_kb(),
+        )
+    await call.answer()
+
+
+async def _parse_chat_ref(message: Message) -> tuple[int | None, str]:
     chat_id: int | None = None
     title = ""
     if message.forward_from_chat:
@@ -1413,33 +1438,306 @@ async def set_log_group(
         title = getattr(ch, "title", "") or ""
     elif message.text and message.text.strip().lstrip("-").isdigit():
         chat_id = int(message.text.strip())
-    else:
-        await message.answer(
-            "Перешли сообщение из лог-группы или пришли числовой chat_id"
-        )
+    return chat_id, title
+
+
+@router.message(AddLogGroupStates.waiting)
+@router.message(AddLogGroupStates.for_account)
+async def log_add_waiting(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(message, mailer_config, mailer_db):
+        await _deny(message)
         return
-
-    await mailer_db.set_setting("log_group_id", str(chat_id))
+    chat_id, title = await _parse_chat_ref(message)
+    if chat_id is None:
+        await message.answer("Перешли сообщение из группы или числовой chat_id")
+        return
+    data = await state.get_data()
+    link_aid = data.get("link_account_id")
+    lid = await mailer_db.add_log_group(chat_id, title=title)
+    if link_aid:
+        await mailer_db.link_account_log_group(int(link_aid), lid)
     await state.clear()
-
     try:
         await message.bot.send_message(
             chat_id,
-            f"✅ Лог-группа подключена к Mailer.\n"
-            f"{('Группа: ' + title) if title else ''}",
+            f"✅ Log group connected to mailer.\n"
+            f"{('Title: ' + title) if title else ''}",
         )
-        probe = "Тестовое сообщение в лог отправлено."
+        probe = "Test message sent."
     except Exception as e:
-        probe = (
-            f"chat_id сохранён, но бот не смог написать: {e}\n"
-            f"Добавь бота в группу и дай право писать."
-        )
-
+        probe = f"Saved, but bot cannot write: {e}"
+    extra = f"\nПривязана к аккаунту #{link_aid}" if link_aid else ""
     await message.answer(
-        f"✅ Лог-группа: <code>{chat_id}</code>\n{probe}",
+        f"✅ Лог-группа #{lid}: <code>{chat_id}</code>\n{probe}{extra}",
         reply_markup=kb.back_main(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("log:view:"))
+async def log_view(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    lid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    lg = await mailer_db.get_log_group(lid)
+    if not lg:
+        await call.answer("Не найдена", show_alert=True)
+        return
+    if call.message:
+        await call.message.edit_text(
+            f"<b>Лог-группа #{lg['id']}</b>\n"
+            f"Название: {lg.get('title')}\n"
+            f"chat_id: <code>{lg['chat_id']}</code>\n"
+            f"Активна: {'да' if lg.get('active') else 'нет'}",
+            reply_markup=kb.log_group_card(lid, bool(lg.get("active"))),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("log:on:"))
+async def log_on(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    lid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await mailer_db.set_log_group_active(lid, True)
+    call.data = f"log:view:{lid}"
+    await log_view(call, mailer_config, mailer_db)
+
+
+@router.callback_query(F.data.startswith("log:off:"))
+async def log_off(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    lid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await mailer_db.set_log_group_active(lid, False)
+    call.data = f"log:view:{lid}"
+    await log_view(call, mailer_config, mailer_db)
+
+
+@router.callback_query(F.data.startswith("log:del:"))
+async def log_del(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    lid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await mailer_db.delete_log_group(lid)
+    await call.answer("Удалена")
+    await menu_logs(call, state, mailer_config, mailer_db)
+
+
+# ── per-account groups / logs / client ────────────────────────
+
+
+@router.callback_query(F.data.startswith("acc:client:"))
+async def acc_client(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(ClientLabelStates.waiting)
+    await state.update_data(account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Метка клиента для аккаунта #{aid} "
+            f"(например имя рекламодателя):\n"
+            f"Отправь текст или <code>-</code> чтобы очистить.",
+            reply_markup=kb.cancel_kb(),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.message(ClientLabelStates.waiting)
+async def acc_client_val(
+    message: Message,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(message, mailer_config, mailer_db):
+        await _deny(message)
+        return
+    data = await state.get_data()
+    aid = int(data["account_id"])
+    raw = (message.text or "").strip()
+    if raw in ("-", "—", "0"):
+        raw = ""
+    await mailer_db.set_client_label(aid, raw)
+    await state.clear()
+    await message.answer(
+        f"✅ Клиент аккаунта #{aid}: <b>{_html_esc(raw or '—')}</b>",
+        reply_markup=kb.back_main(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("acc:grps:"))
+async def acc_grps(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    all_g = await mailer_db.list_groups()
+    linked = {g["id"] for g in await mailer_db.list_account_groups(aid, only_active=False)}
+    if call.message:
+        await call.message.edit_text(
+            f"<b>Группы рассылки аккаунта #{aid}</b>\n\n"
+            f"Отметь ✅ группы, куда <b>этот</b> аккаунт шлёт рекламу.\n"
+            f"Другой аккаунт / клиент — другие галочки.",
+            reply_markup=kb.account_groups_menu(aid, all_g, linked),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("acc:grptog:"))
+async def acc_grp_tog(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    # acc:grptog:aid:gid
+    parts = call.data.split(":")  # type: ignore[union-attr]
+    aid, gid = int(parts[2]), int(parts[3])
+    if await mailer_db.account_has_group(aid, gid):
+        await mailer_db.unlink_account_group(aid, gid)
+    else:
+        await mailer_db.link_account_group(aid, gid)
+    call.data = f"acc:grps:{aid}"
+    await acc_grps(call, mailer_config, mailer_db)
+
+
+@router.callback_query(F.data.startswith("acc:grpadd:"))
+async def acc_grp_add(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(AddGroupStates.for_account)
+    await state.update_data(link_account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Группа для аккаунта #{aid}: перешли сообщение из группы "
+            f"или @username / invite / chat_id.",
+            reply_markup=kb.cancel_kb(),
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("acc:logs:"))
+async def acc_logs(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    all_l = await mailer_db.list_log_groups()
+    linked = {x["id"] for x in await mailer_db.list_account_log_groups(aid)}
+    # list_account_log_groups only active — for toggle menu show all linked via raw
+    cur_linked = await mailer_db.db.execute(
+        "SELECT log_group_id FROM account_log_groups WHERE account_id = ?", (aid,)
+    )
+    linked = {int(r[0]) for r in await cur_linked.fetchall()}
+    if call.message:
+        await call.message.edit_text(
+            f"<b>Лог-группы аккаунта #{aid}</b>\n\n"
+            f"Сюда пишутся отправки / конец круга <b>только этого</b> клиента.\n"
+            f"Можно несколько галочек.",
+            reply_markup=kb.account_logs_menu(aid, all_l, linked),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("acc:logtog:"))
+async def acc_log_tog(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    parts = call.data.split(":")  # type: ignore[union-attr]
+    aid, lid = int(parts[2]), int(parts[3])
+    cur = await mailer_db.db.execute(
+        "SELECT 1 FROM account_log_groups WHERE account_id = ? AND log_group_id = ?",
+        (aid, lid),
+    )
+    if await cur.fetchone():
+        await mailer_db.unlink_account_log_group(aid, lid)
+    else:
+        await mailer_db.link_account_log_group(aid, lid)
+    call.data = f"acc:logs:{aid}"
+    await acc_logs(call, mailer_config, mailer_db)
+
+
+@router.callback_query(F.data.startswith("acc:logadd:"))
+async def acc_log_add(
+    call: CallbackQuery,
+    state: FSMContext,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    await state.set_state(AddLogGroupStates.for_account)
+    await state.update_data(link_account_id=aid)
+    if call.message:
+        await call.message.edit_text(
+            f"Новая лог-группа для аккаунта #{aid}:\n"
+            f"перешли сообщение из группы или chat_id.",
+            reply_markup=kb.cancel_kb(),
+        )
+    await call.answer()
 
 
 # ── team (operators) ──────────────────────────────────────────

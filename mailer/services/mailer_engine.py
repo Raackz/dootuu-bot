@@ -1,4 +1,4 @@
-"""Background mailing loop: accounts → groups, cycles + cooldown.
+"""Background mailing loop — per-account groups & log groups (client isolation).
 
 Public / log-facing strings are English (US audience).
 Admin bot UI stays Russian in handlers.
@@ -85,10 +85,9 @@ class MailerEngine:
                 await asyncio.sleep(5)
 
     async def _tick(self) -> tuple[bool, float]:
-        """One send attempt. Returns (did_work, sleep_seconds)."""
+        """One send for one ready account into its own group list."""
         accounts = await self.db.list_accounts()
-        groups = await self.db.list_groups(only_active=True)
-        if not accounts or not groups:
+        if not accounts:
             return False, 3.0
 
         ready: list[dict] = []
@@ -106,14 +105,23 @@ class MailerEngine:
             text = await self.db.account_message_text(acc)
             if not text:
                 continue
+            groups = await self.db.list_account_groups(acc["id"], only_active=True)
+            if not groups:
+                continue
             ready.append(acc)
 
         if not ready:
             return False, 3.0
 
+        # rotate among accounts that have their own work
         idx = self._account_rr % len(ready)
         account = ready[idx]
         self._account_rr = (idx + 1) % max(len(ready), 1)
+
+        # only THIS account's groups
+        groups = await self.db.list_account_groups(account["id"], only_active=True)
+        if not groups:
+            return False, 3.0
 
         aid = int(account["id"])
         g_idx = self._group_rr.get(aid, 0) % len(groups)
@@ -169,11 +177,13 @@ class MailerEngine:
                 (time.time() + int(flood) + 5, err, account["id"]),
             )
             await self.db.db.commit()
-            await self._notify_log_raw(
+            await self._notify_account(
+                account["id"],
                 f"⏳ <b>Paused (Telegram rate limit)</b>\n"
                 f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
+                f"Client: <b>{_esc(account.get('client_label') or '—')}</b>\n"
                 f"Wait: {_fmt_duration(int(flood) + 5)}\n"
-                f"Reason: <code>{_esc(err)}</code>"
+                f"Reason: <code>{_esc(err)}</code>",
             )
         else:
             await self.db.set_account_status(account["id"], "active", error=err)
@@ -188,6 +198,12 @@ class MailerEngine:
         )
         return True, delay
 
+    def _client_line(self, account: dict) -> str:
+        cl = (account.get("client_label") or "").strip()
+        if cl:
+            return f"Client: <b>{_esc(cl)}</b>\n"
+        return ""
+
     async def _notify_cycle_finished(self, account: dict) -> None:
         pause = await self.db.account_cycle_pause(account)
         limit = await self.db.account_cycle_limit(account)
@@ -196,12 +212,13 @@ class MailerEngine:
         text = (
             f"⏹ <b>Broadcast cycle finished</b>\n\n"
             f"Account: <b>{_esc(str(label))}</b>\n"
+            f"{self._client_line(account)}"
             f"Messages sent this cycle: <b>{limit}</b>\n"
             f"Cooldown until next cycle: <b>{_fmt_duration(pause)}</b>\n"
             f"Next cycle around: <b>{_fmt_clock(float(next_at))}</b>\n\n"
             f"This account is on cooldown; sending is paused until the next cycle."
         )
-        await self._notify_log_raw(text)
+        await self._notify_account(account["id"], text)
 
     async def _notify_cycle_started(self, account: dict) -> None:
         limit = await self.db.account_cycle_limit(account)
@@ -209,10 +226,11 @@ class MailerEngine:
         text = (
             f"▶️ <b>New broadcast cycle started</b>\n\n"
             f"Account: <b>{_esc(str(label))}</b>\n"
+            f"{self._client_line(account)}"
             f"Cycle message limit: <b>{limit}</b>\n"
             f"Time: {_fmt_clock(time.time())}"
         )
-        await self._notify_log_raw(text)
+        await self._notify_account(account["id"], text)
 
     async def _notify_log(
         self,
@@ -230,6 +248,7 @@ class MailerEngine:
         text = (
             f"{status}\n"
             f"Account: <b>{_esc(label)}</b>\n"
+            f"{self._client_line(account)}"
             f"Group: <b>{_esc(str(gtitle))}</b>\n"
             f"Chat ID: <code>{group.get('chat_id')}</code>\n"
             f"Cycle progress: <b>{sent}/{cycle_limit}</b>\n"
@@ -237,21 +256,19 @@ class MailerEngine:
         )
         if extra:
             text += f"\nError: <code>{_esc(extra)}</code>"
-        await self._notify_log_raw(text)
+        await self._notify_account(account["id"], text)
 
-    async def _notify_log_raw(self, html: str) -> None:
-        log_id = await self.db.get_setting("log_group_id", "")
-        if not log_id:
-            log.info("cycle notify (no log group): %s", html[:200])
+    async def _notify_account(self, account_id: int, html: str) -> None:
+        """Send to all log groups linked to this account."""
+        chat_ids = await self.db.account_log_chat_ids(account_id)
+        if not chat_ids:
+            log.info("notify account=%s (no log groups): %s", account_id, html[:160])
             return
-        try:
-            chat_id = int(log_id)
-        except ValueError:
-            return
-        try:
-            await self.bot.send_message(chat_id, html, parse_mode="HTML")
-        except Exception as e:
-            log.warning("log group notify failed: %s", e)
+        for chat_id in chat_ids:
+            try:
+                await self.bot.send_message(chat_id, html, parse_mode="HTML")
+            except Exception as e:
+                log.warning("log group %s notify failed: %s", chat_id, e)
 
 
 def _esc(s: str) -> str:

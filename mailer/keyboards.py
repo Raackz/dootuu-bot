@@ -10,12 +10,12 @@ def main_menu(mailing_on: bool = False) -> InlineKeyboardMarkup:
             callback_data="acc:add",
         )
     )
-    b.row(InlineKeyboardButton(text="👤 Аккаунты", callback_data="menu:accounts"))
-    b.row(InlineKeyboardButton(text="👥 Группы", callback_data="menu:groups"))
+    b.row(InlineKeyboardButton(text="👤 Аккаунты (клиенты)", callback_data="menu:accounts"))
+    b.row(InlineKeyboardButton(text="👥 Пул групп", callback_data="menu:groups"))
+    b.row(InlineKeyboardButton(text="📋 Пул лог-групп", callback_data="menu:logs"))
     b.row(InlineKeyboardButton(text="✉️ Сообщения", callback_data="menu:messages"))
     b.row(InlineKeyboardButton(text="🔑 API Telegram", callback_data="menu:api"))
     b.row(InlineKeyboardButton(text="⚙️ Настройки / цикл", callback_data="menu:settings"))
-    b.row(InlineKeyboardButton(text="📋 Лог-группа", callback_data="menu:log"))
     b.row(InlineKeyboardButton(text="🧑‍🤝‍🧑 Команда", callback_data="menu:team"))
     if mailing_on:
         b.row(InlineKeyboardButton(text="⏹ Стоп рассылки", callback_data="mail:stop"))
@@ -67,8 +67,26 @@ def account_card(account_id: int, status: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(
         InlineKeyboardButton(
+            text="🏷️ Клиент (метка)",
+            callback_data=f"acc:client:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
             text="✉️ Сообщение аккаунта",
             callback_data=f"acc:msg:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="📣 Группы рассылки (этого аккаунта)",
+            callback_data=f"acc:grps:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="📋 Лог-группы (этого аккаунта)",
+            callback_data=f"acc:logs:{account_id}",
         )
     )
     b.row(
@@ -83,6 +101,85 @@ def account_card(account_id: int, status: str) -> InlineKeyboardMarkup:
         b.row(InlineKeyboardButton(text="Выключить", callback_data=f"acc:disable:{account_id}"))
     b.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"acc:del:{account_id}"))
     b.row(InlineKeyboardButton(text="« Аккаунты", callback_data="menu:accounts"))
+    return b.as_markup()
+
+
+def account_groups_menu(
+    account_id: int,
+    all_groups: list[dict],
+    linked_ids: set[int],
+) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="➕ Добавить новую группу сюда",
+            callback_data=f"acc:grpadd:{account_id}",
+        )
+    )
+    for g in all_groups:
+        on = g["id"] in linked_ids
+        mark = "✅" if on else "☐"
+        title = (g.get("title") or str(g.get("chat_id")))[:22]
+        b.row(
+            InlineKeyboardButton(
+                text=f"{mark} {title}",
+                callback_data=f"acc:grptog:{account_id}:{g['id']}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Аккаунт", callback_data=f"acc:view:{account_id}"))
+    return b.as_markup()
+
+
+def account_logs_menu(
+    account_id: int,
+    all_logs: list[dict],
+    linked_ids: set[int],
+) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(
+            text="➕ Добавить новую лог-группу",
+            callback_data=f"acc:logadd:{account_id}",
+        )
+    )
+    for lg in all_logs:
+        on = lg["id"] in linked_ids
+        mark = "✅" if on else "☐"
+        title = (lg.get("title") or str(lg.get("chat_id")))[:22]
+        b.row(
+            InlineKeyboardButton(
+                text=f"{mark} {title}",
+                callback_data=f"acc:logtog:{account_id}:{lg['id']}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Аккаунт", callback_data=f"acc:view:{account_id}"))
+    return b.as_markup()
+
+
+def log_groups_pool_menu(logs: list[dict]) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="➕ Добавить лог-группу", callback_data="log:add"))
+    for lg in logs:
+        icon = "🟢" if lg.get("active") else "⚪"
+        title = (lg.get("title") or str(lg.get("chat_id")))[:28]
+        b.row(
+            InlineKeyboardButton(
+                text=f"{icon} {title}",
+                callback_data=f"log:view:{lg['id']}",
+            )
+        )
+    b.row(InlineKeyboardButton(text="« Меню", callback_data="menu:main"))
+    return b.as_markup()
+
+
+def log_group_card(log_group_id: int, active: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    if active:
+        b.row(InlineKeyboardButton(text="Выключить", callback_data=f"log:off:{log_group_id}"))
+    else:
+        b.row(InlineKeyboardButton(text="Включить", callback_data=f"log:on:{log_group_id}"))
+    b.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"log:del:{log_group_id}"))
+    b.row(InlineKeyboardButton(text="« Лог-группы", callback_data="menu:logs"))
     return b.as_markup()
 
 

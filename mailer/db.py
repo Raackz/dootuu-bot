@@ -93,6 +93,29 @@ class MailerDB:
                 full_name TEXT NOT NULL DEFAULT '',
                 added_at REAL NOT NULL
             );
+
+            -- multi log groups (pool)
+            CREATE TABLE IF NOT EXISTS log_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL UNIQUE,
+                title TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL
+            );
+
+            -- which target groups each mailing account uses (client isolation)
+            CREATE TABLE IF NOT EXISTS account_groups (
+                account_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                PRIMARY KEY (account_id, group_id)
+            );
+
+            -- which log groups receive events for this account
+            CREATE TABLE IF NOT EXISTS account_log_groups (
+                account_id INTEGER NOT NULL,
+                log_group_id INTEGER NOT NULL,
+                PRIMARY KEY (account_id, log_group_id)
+            );
             """
         )
         await self.db.commit()
@@ -102,6 +125,7 @@ class MailerDB:
         await self._ensure_column("accounts", "cycle_pause_sec", "INTEGER")
         await self._ensure_column("accounts", "delay_sec", "REAL")
         await self._ensure_column("accounts", "added_by", "INTEGER")
+        await self._ensure_column("accounts", "client_label", "TEXT NOT NULL DEFAULT ''")
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
@@ -126,6 +150,51 @@ class MailerDB:
                 ("default", "Hello! 👋", now, now),
             )
         await self.db.commit()
+        await self._migrate_multi_tenant()
+
+    async def _migrate_multi_tenant(self) -> None:
+        """One-time: legacy single log_group + shared groups → multi-tenant tables."""
+        # legacy log_group_id → log_groups pool
+        legacy = (await self.get_setting("log_group_id", "")).strip()
+        if legacy.lstrip("-").isdigit():
+            chat_id = int(legacy)
+            cur = await self.db.execute(
+                "SELECT id FROM log_groups WHERE chat_id = ?", (chat_id,)
+            )
+            if not await cur.fetchone():
+                await self.db.execute(
+                    "INSERT INTO log_groups (chat_id, title, active, created_at) VALUES (?, ?, 1, ?)",
+                    (chat_id, f"log {chat_id}", time.time()),
+                )
+                await self.db.commit()
+
+        # if no account_groups links yet, attach all groups to all accounts (keep old behavior once)
+        cur = await self.db.execute("SELECT COUNT(*) AS c FROM account_groups")
+        row = await cur.fetchone()
+        if row and int(row["c"]) == 0:
+            accounts = await self.list_accounts()
+            groups = await self.list_groups(only_active=False)
+            for a in accounts:
+                for g in groups:
+                    await self.db.execute(
+                        "INSERT OR IGNORE INTO account_groups (account_id, group_id) VALUES (?, ?)",
+                        (a["id"], g["id"]),
+                    )
+            await self.db.commit()
+
+        # if no account_log_groups, attach all log_groups to all accounts
+        cur = await self.db.execute("SELECT COUNT(*) AS c FROM account_log_groups")
+        row = await cur.fetchone()
+        if row and int(row["c"]) == 0:
+            accounts = await self.list_accounts()
+            logs = await self.list_log_groups()
+            for a in accounts:
+                for lg in logs:
+                    await self.db.execute(
+                        "INSERT OR IGNORE INTO account_log_groups (account_id, log_group_id) VALUES (?, ?)",
+                        (a["id"], lg["id"]),
+                    )
+            await self.db.commit()
 
     async def _ensure_column(self, table: str, column: str, decl: str) -> None:
         cur = await self.db.execute(f"PRAGMA table_info({table})")
@@ -235,7 +304,16 @@ class MailerDB:
         await self.db.commit()
 
     async def delete_account(self, account_id: int) -> None:
+        await self.db.execute("DELETE FROM account_groups WHERE account_id = ?", (account_id,))
+        await self.db.execute("DELETE FROM account_log_groups WHERE account_id = ?", (account_id,))
         await self.db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+        await self.db.commit()
+
+    async def set_client_label(self, account_id: int, label: str) -> None:
+        await self.db.execute(
+            "UPDATE accounts SET client_label = ? WHERE id = ?",
+            ((label or "").strip()[:64], account_id),
+        )
         await self.db.commit()
 
     async def set_account_message(self, account_id: int, text: str) -> None:
@@ -415,6 +493,117 @@ class MailerDB:
             (time.time(), group_id),
         )
         await self.db.commit()
+
+    # ── account ↔ target groups (per-client isolation) ────────
+
+    async def list_account_groups(self, account_id: int, only_active: bool = True) -> list[dict[str, Any]]:
+        q = (
+            "SELECT g.* FROM groups g "
+            "INNER JOIN account_groups ag ON ag.group_id = g.id "
+            "WHERE ag.account_id = ?"
+        )
+        if only_active:
+            q += " AND g.active = 1"
+        q += " ORDER BY g.id"
+        cur = await self.db.execute(q, (account_id,))
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def link_account_group(self, account_id: int, group_id: int) -> None:
+        await self.db.execute(
+            "INSERT OR IGNORE INTO account_groups (account_id, group_id) VALUES (?, ?)",
+            (account_id, group_id),
+        )
+        await self.db.commit()
+
+    async def unlink_account_group(self, account_id: int, group_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM account_groups WHERE account_id = ? AND group_id = ?",
+            (account_id, group_id),
+        )
+        await self.db.commit()
+
+    async def account_has_group(self, account_id: int, group_id: int) -> bool:
+        cur = await self.db.execute(
+            "SELECT 1 FROM account_groups WHERE account_id = ? AND group_id = ?",
+            (account_id, group_id),
+        )
+        return (await cur.fetchone()) is not None
+
+    # ── log groups (multi) ────────────────────────────────────
+
+    async def add_log_group(self, chat_id: int, title: str = "") -> int:
+        now = time.time()
+        await self.db.execute(
+            "INSERT INTO log_groups (chat_id, title, active, created_at) VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, active = 1",
+            (chat_id, title or str(chat_id), now),
+        )
+        await self.db.commit()
+        cur = await self.db.execute("SELECT id FROM log_groups WHERE chat_id = ?", (chat_id,))
+        row = await cur.fetchone()
+        return int(row["id"]) if row else 0
+
+    async def list_log_groups(self, only_active: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM log_groups"
+        if only_active:
+            q += " WHERE active = 1"
+        q += " ORDER BY id"
+        cur = await self.db.execute(q)
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def get_log_group(self, log_group_id: int) -> dict[str, Any] | None:
+        cur = await self.db.execute("SELECT * FROM log_groups WHERE id = ?", (log_group_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def set_log_group_active(self, log_group_id: int, active: bool) -> None:
+        await self.db.execute(
+            "UPDATE log_groups SET active = ? WHERE id = ?",
+            (1 if active else 0, log_group_id),
+        )
+        await self.db.commit()
+
+    async def delete_log_group(self, log_group_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM account_log_groups WHERE log_group_id = ?", (log_group_id,)
+        )
+        await self.db.execute("DELETE FROM log_groups WHERE id = ?", (log_group_id,))
+        await self.db.commit()
+
+    async def list_account_log_groups(self, account_id: int) -> list[dict[str, Any]]:
+        cur = await self.db.execute(
+            "SELECT lg.* FROM log_groups lg "
+            "INNER JOIN account_log_groups alg ON alg.log_group_id = lg.id "
+            "WHERE alg.account_id = ? AND lg.active = 1 ORDER BY lg.id",
+            (account_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def link_account_log_group(self, account_id: int, log_group_id: int) -> None:
+        await self.db.execute(
+            "INSERT OR IGNORE INTO account_log_groups (account_id, log_group_id) VALUES (?, ?)",
+            (account_id, log_group_id),
+        )
+        await self.db.commit()
+
+    async def unlink_account_log_group(self, account_id: int, log_group_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM account_log_groups WHERE account_id = ? AND log_group_id = ?",
+            (account_id, log_group_id),
+        )
+        await self.db.commit()
+
+    async def account_log_chat_ids(self, account_id: int) -> list[int]:
+        """Chat IDs to notify for this account (multi log groups)."""
+        logs = await self.list_account_log_groups(account_id)
+        ids = [int(x["chat_id"]) for x in logs]
+        if ids:
+            return ids
+        # legacy single setting fallback
+        legacy = (await self.get_setting("log_group_id", "")).strip()
+        if legacy.lstrip("-").isdigit():
+            return [int(legacy)]
+        return []
 
     # ── messages ──────────────────────────────────────────────
 

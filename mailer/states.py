@@ -10,6 +10,16 @@ class AddAccountStates(StatesGroup):
 
 class AddGroupStates(StatesGroup):
     waiting = State()
+    for_account = State()  # add group and link to account_id
+
+
+class AddLogGroupStates(StatesGroup):
+    waiting = State()
+    for_account = State()
+
+
+class ClientLabelStates(StatesGroup):
+    waiting = State()
 
 
 class MessageStates(StatesGroup):
