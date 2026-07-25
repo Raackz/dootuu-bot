@@ -123,7 +123,7 @@ class MailerDB:
             now = time.time()
             await self.db.execute(
                 "INSERT INTO messages (title, text, active, updated_at, created_at) VALUES (?, ?, 1, ?, ?)",
-                ("default", "Привет! 👋", now, now),
+                ("default", "Hello! 👋", now, now),
             )
         await self.db.commit()
 
