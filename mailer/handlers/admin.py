@@ -72,18 +72,45 @@ async def _deny(event: Message | CallbackQuery) -> None:
         await event.answer(text, parse_mode="HTML")
 
 
+def _fmt_left_ru(sec: float) -> str:
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м"
+    if m:
+        return f"{m}м {s}с"
+    return f"{s}с"
+
+
+def _fmt_duration_choice(sec: int) -> str:
+    if sec <= 0:
+        return "без лимита"
+    if sec < 3600:
+        return f"{sec // 60} мин"
+    h = sec // 3600
+    return f"{h} ч" if h != 1 else "1 час"
+
+
 async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
     st = await db.stats()
     cycle = await db.get_int("cycle_limit", 50)
     pause = await db.get_int("cycle_pause_sec", 3600)
     delay = await db.get_float("delay_sec", 8)
+    dur_def = await db.get_mailing_duration_default()
     logs_n = len(await db.list_log_groups(only_active=True))
     mail = "🟢 ВКЛ" if st["mailing"] else "🔴 ВЫКЛ"
+    left = await db.mailing_time_left() if st["mailing"] else None
+    if st["mailing"] and left is not None:
+        mail += f" · осталось <b>{_fmt_left_ru(left)}</b>"
+    elif st["mailing"]:
+        mail += " · без лимита"
     api_ok = "✅ задан" if (config and config.telethon_ready) else "❌ не задан → «🔑 API Telegram»"
     open_mode = "да" if (config and config.allow_all) else "только админ"
     return (
         f"<b>Mailer — панель</b>\n\n"
         f"Рассылка: <b>{mail}</b>\n"
+        f"Срок (настр.): <b>{_fmt_duration_choice(dur_def)}</b>\n"
         f"Аккаунты (клиенты): {st['accounts']} "
         f"(active {st['accounts_active']}, cooldown {st['accounts_cooldown']})\n"
         f"Групп в пуле: {st['groups']} · лог-групп: {logs_n}\n"
@@ -211,23 +238,19 @@ async def cb_status(
     await call.answer()
 
 
-# ── mail start/stop ───────────────────────────────────────────
+# ── mail start/stop (+ duration) ──────────────────────────────
 
 
-@router.callback_query(F.data == "mail:start")
-async def mail_start(
+async def _mail_ready_check(
     call: CallbackQuery,
     mailer_config: MailerConfig,
     mailer_db: MailerDB,
-    mailer_engine: MailerEngine,
-) -> None:
-    if not await _is_allowed(call, mailer_config, mailer_db):
-        await _deny(call)
-        return
+) -> bool:
+    """Validate accounts/API before showing duration or starting. False = blocked."""
     accounts = [a for a in await mailer_db.list_accounts() if a["status"] != "disabled"]
     if not accounts:
         await call.answer("Сначала добавь аккаунт", show_alert=True)
-        return
+        return False
     ready = 0
     for a in accounts:
         text = await mailer_db.account_message_text(a)
@@ -239,20 +262,76 @@ async def mail_start(
             "Нет готовых аккаунтов: у каждого нужны своё сообщение + группы рассылки",
             show_alert=True,
         )
-        return
+        return False
     db_id = (await mailer_db.get_setting("tg_api_id", "")).strip()
     db_hash = (await mailer_db.get_setting("tg_api_hash", "")).strip()
     if db_id or db_hash:
         mailer_config.apply_api_from_values(db_id or None, db_hash or None)
     if not mailer_config.telethon_ready:
         await call.answer("Сначала «🔑 API Telegram»", show_alert=True)
+        return False
+    return True
+
+
+@router.callback_query(F.data == "mail:start")
+async def mail_start(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    """Step 1: pick how long the broadcast should run."""
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
         return
-    await mailer_db.set_mailing_enabled(True)
-    mailer_engine.start()
-    await call.answer("Рассылка запущена")
+    if not await _mail_ready_check(call, mailer_config, mailer_db):
+        return
+    dur_def = await mailer_db.get_mailing_duration_default()
     if call.message:
         await call.message.edit_text(
-            await _main_text(mailer_db),
+            "<b>▶️ Старт рассылки</b>\n\n"
+            "Выбери <b>срок</b> — по истечении рассылка остановится сама.\n"
+            "«Без лимита» — только ручной стоп.\n\n"
+            f"Сейчас в настройках: <b>{_fmt_duration_choice(dur_def)}</b>\n"
+            f"<i>Срок также: ⚙️ Настройки → 📅 Срок рассылки</i>",
+            reply_markup=kb.mail_duration_menu(
+                prefix="mail:dur",
+                back="menu:main",
+                selected=dur_def,
+            ),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("mail:dur:"))
+async def mail_start_with_duration(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+    mailer_engine: MailerEngine,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    if not await _mail_ready_check(call, mailer_config, mailer_db):
+        return
+    try:
+        duration = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    except (ValueError, AttributeError):
+        await call.answer("Неверный срок", show_alert=True)
+        return
+    if duration < 0:
+        await call.answer("Неверный срок", show_alert=True)
+        return
+    await mailer_db.start_mailing(duration if duration > 0 else None)
+    mailer_engine.start()
+    if duration > 0:
+        await call.answer(f"Рассылка на {_fmt_left_ru(duration)}")
+    else:
+        await call.answer("Рассылка без лимита")
+    if call.message:
+        await call.message.edit_text(
+            await _main_text(mailer_db, mailer_config),
             reply_markup=kb.main_menu(True),
             parse_mode="HTML",
         )
@@ -271,7 +350,7 @@ async def mail_stop(
     await call.answer("Рассылка остановлена")
     if call.message:
         await call.message.edit_text(
-            await _main_text(mailer_db),
+            await _main_text(mailer_db, mailer_config),
             reply_markup=kb.main_menu(False),
             parse_mode="HTML",
         )
@@ -1220,6 +1299,35 @@ async def msg_new_text(
 # ── settings / cycle ──────────────────────────────────────────
 
 
+async def _settings_text(db: MailerDB) -> str:
+    cycle = await db.get_int("cycle_limit", 50)
+    pause = await db.get_int("cycle_pause_sec", 3600)
+    delay = await db.get_float("delay_sec", 8)
+    dur_def = await db.get_mailing_duration_default()
+    mailing = await db.is_mailing_enabled()
+    if mailing:
+        left = await db.mailing_time_left()
+        if left is not None:
+            run_line = f"сейчас ВКЛ · осталось <b>{_fmt_left_ru(left)}</b>"
+        else:
+            run_line = "сейчас ВКЛ · <b>без лимита</b>"
+    else:
+        run_line = "сейчас ВЫКЛ"
+    return (
+        f"<b>Настройки / цикл</b>\n\n"
+        f"📅 <b>Срок рассылки:</b> {_fmt_duration_choice(dur_def)}\n"
+        f"   ({run_line})\n"
+        f"   По истечении срока рассылка останавливается сама.\n\n"
+        f"🔢 Лимит сообщений в круге: <b>{cycle}</b>\n"
+        f"⏱ Пауза после круга: <b>{pause}</b> сек ({pause // 60} мин)\n"
+        f"⏳ Пауза между отправками: <b>{delay}</b> сек\n\n"
+        f"После N успешных отправок аккаунт уходит на паузу, "
+        f"затем — новый круг.\n"
+        f"Срок меняется кнопкой ниже; если рассылка уже идёт — "
+        f"таймер перезапустится от сейчас."
+    )
+
+
 @router.callback_query(F.data == "menu:settings")
 async def menu_settings(
     call: CallbackQuery,
@@ -1231,22 +1339,75 @@ async def menu_settings(
         await _deny(call)
         return
     await state.clear()
-    cycle = await mailer_db.get_int("cycle_limit", 50)
-    pause = await mailer_db.get_int("cycle_pause_sec", 3600)
-    delay = await mailer_db.get_float("delay_sec", 8)
-    text = (
-        f"<b>Настройки цикла</b>\n\n"
-        f"Лимит сообщений в круге: <b>{cycle}</b>\n"
-        f"Пауза после круга: <b>{pause}</b> сек ({pause // 60} мин)\n"
-        f"Пауза между отправками: <b>{delay}</b> сек\n\n"
-        f"После N успешных отправок аккаунт уходит на паузу, "
-        f"через час (или сколько задашь) — новый круг."
-    )
     if call.message:
         await call.message.edit_text(
-            text, reply_markup=kb.settings_menu(), parse_mode="HTML"
+            await _settings_text(mailer_db),
+            reply_markup=kb.settings_menu(),
+            parse_mode="HTML",
         )
     await call.answer()
+
+
+@router.callback_query(F.data == "set:duration")
+async def set_duration(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    dur_def = await mailer_db.get_mailing_duration_default()
+    mailing = await mailer_db.is_mailing_enabled()
+    extra = ""
+    if mailing:
+        left = await mailer_db.mailing_time_left()
+        if left is not None:
+            extra = f"\nСейчас идёт · осталось <b>{_fmt_left_ru(left)}</b> — выбор сбросит таймер."
+        else:
+            extra = "\nСейчас идёт · без лимита — выбор поставит таймер."
+    if call.message:
+        await call.message.edit_text(
+            f"<b>📅 Срок рассылки</b>\n\n"
+            f"Текущий: <b>{_fmt_duration_choice(dur_def)}</b>\n"
+            f"По окончании срока рассылка <b>закончится автоматически</b>.\n"
+            f"«Без лимита» — только ручной стоп.{extra}",
+            reply_markup=kb.mail_duration_menu(
+                prefix="set:dur",
+                back="menu:settings",
+                selected=dur_def,
+            ),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("set:dur:"))
+async def set_duration_val(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    try:
+        duration = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    except (ValueError, AttributeError):
+        await call.answer("Неверный срок", show_alert=True)
+        return
+    if duration < 0:
+        await call.answer("Неверный срок", show_alert=True)
+        return
+    await mailer_db.set_mailing_duration_default(duration)
+    label = _fmt_duration_choice(duration)
+    await call.answer(f"Срок: {label}")
+    if call.message:
+        await call.message.edit_text(
+            await _settings_text(mailer_db),
+            reply_markup=kb.settings_menu(),
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data == "set:cycle_limit")

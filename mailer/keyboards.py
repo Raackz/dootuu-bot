@@ -25,6 +25,48 @@ def main_menu(mailing_on: bool = False) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+MAIL_DURATION_OPTIONS: list[tuple[str, int]] = [
+    ("30 мин", 30 * 60),
+    ("1 час", 60 * 60),
+    ("2 часа", 2 * 60 * 60),
+    ("3 часа", 3 * 60 * 60),
+    ("6 часов", 6 * 60 * 60),
+    ("12 часов", 12 * 60 * 60),
+    ("24 часа", 24 * 60 * 60),
+    ("Без лимита", 0),
+]
+
+
+def mail_duration_menu(
+    *,
+    prefix: str = "mail:dur",
+    back: str = "menu:main",
+    selected: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Pick how long the broadcast runs before auto-stop.
+
+    prefix: callback prefix (mail:dur for start, set:dur for settings).
+    selected: mark current default with ✅.
+    """
+    b = InlineKeyboardBuilder()
+    row: list[InlineKeyboardButton] = []
+    for label, sec in MAIL_DURATION_OPTIONS:
+        mark = "✅ " if selected is not None and sec == selected else ""
+        row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{label}",
+                callback_data=f"{prefix}:{sec}",
+            )
+        )
+        if len(row) == 2:
+            b.row(*row)
+            row = []
+    if row:
+        b.row(*row)
+    b.row(InlineKeyboardButton(text="« Назад", callback_data=back))
+    return b.as_markup()
+
+
 def back_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="« Меню", callback_data="menu:main")]]
@@ -284,6 +326,7 @@ def message_card(message_id: int) -> InlineKeyboardMarkup:
 
 def settings_menu() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📅 Срок рассылки", callback_data="set:duration"))
     b.row(InlineKeyboardButton(text="🔢 Лимит круга", callback_data="set:cycle_limit"))
     b.row(InlineKeyboardButton(text="⏱ Пауза между кругами", callback_data="set:cycle_pause"))
     b.row(InlineKeyboardButton(text="⏳ Задержка между сообщениями", callback_data="set:delay"))

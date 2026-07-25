@@ -129,6 +129,8 @@ class MailerDB:
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
+            "mailing_ends_at": "",  # unix ts; empty = unlimited / no deadline
+            "mailing_duration_sec": "0",  # default term on start: 0 = unlimited
             "log_group_id": "",
             "cycle_limit": "50",
             "cycle_pause_sec": "3600",
@@ -235,6 +237,63 @@ class MailerDB:
 
     async def set_mailing_enabled(self, enabled: bool) -> None:
         await self.set_setting("mailing_enabled", "1" if enabled else "0")
+        if not enabled:
+            await self.set_setting("mailing_ends_at", "")
+
+    async def start_mailing(self, duration_sec: int | None = None) -> None:
+        """Enable mailing. duration_sec=None/0 → no deadline; else auto-stop after N seconds."""
+        await self.set_setting("mailing_enabled", "1")
+        if duration_sec and duration_sec > 0:
+            await self.set_setting("mailing_ends_at", str(time.time() + int(duration_sec)))
+        else:
+            await self.set_setting("mailing_ends_at", "")
+        # remember last/default choice for settings UI
+        await self.set_setting(
+            "mailing_duration_sec",
+            str(int(duration_sec) if duration_sec and duration_sec > 0 else 0),
+        )
+
+    async def get_mailing_duration_default(self) -> int:
+        """Preferred duration in seconds (0 = unlimited)."""
+        return max(0, await self.get_int("mailing_duration_sec", 0))
+
+    async def set_mailing_duration_default(self, duration_sec: int) -> None:
+        """Save default term; if mailing is on — reset the active deadline from now."""
+        sec = max(0, int(duration_sec))
+        await self.set_setting("mailing_duration_sec", str(sec))
+        if await self.is_mailing_enabled():
+            if sec > 0:
+                await self.set_setting("mailing_ends_at", str(time.time() + sec))
+            else:
+                await self.set_setting("mailing_ends_at", "")
+
+    async def get_mailing_ends_at(self) -> float | None:
+        raw = (await self.get_setting("mailing_ends_at", "")).strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    async def mailing_time_left(self) -> float | None:
+        """Seconds until auto-stop, None if unlimited, 0 if already expired."""
+        ends = await self.get_mailing_ends_at()
+        if ends is None:
+            return None
+        return max(0.0, ends - time.time())
+
+    async def check_and_expire_mailing(self) -> bool:
+        """If deadline passed — disable mailing. Returns True when just expired."""
+        if not await self.is_mailing_enabled():
+            return False
+        ends = await self.get_mailing_ends_at()
+        if ends is None:
+            return False
+        if time.time() >= ends:
+            await self.set_mailing_enabled(False)
+            return True
+        return False
 
     # ── accounts ──────────────────────────────────────────────
 

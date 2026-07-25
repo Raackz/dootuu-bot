@@ -76,6 +76,12 @@ class MailerEngine:
                 if not await self.db.is_mailing_enabled():
                     await asyncio.sleep(2)
                     continue
+                # auto-stop when selected duration expires
+                if await self.db.check_and_expire_mailing():
+                    log.info("Mailing auto-stopped: duration expired")
+                    await self._notify_mailing_ended()
+                    await asyncio.sleep(2)
+                    continue
                 did_work, delay = await self._tick()
                 await asyncio.sleep(delay if did_work else 3.0)
             except asyncio.CancelledError:
@@ -83,6 +89,25 @@ class MailerEngine:
             except Exception:
                 log.exception("mailer loop error")
                 await asyncio.sleep(5)
+
+    async def _notify_mailing_ended(self) -> None:
+        """Tell every active log group that the timed broadcast finished."""
+        text = (
+            "⏹ <b>Broadcast ended</b>\n\n"
+            "Scheduled duration expired. Mailing has been stopped automatically.\n"
+            f"Time: {_fmt_clock(time.time())}"
+        )
+        logs = await self.db.list_log_groups(only_active=True)
+        chat_ids = [int(lg["chat_id"]) for lg in logs]
+        if not chat_ids:
+            legacy = (await self.db.get_setting("log_group_id", "")).strip()
+            if legacy.lstrip("-").isdigit():
+                chat_ids = [int(legacy)]
+        for chat_id in chat_ids:
+            try:
+                await self.bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception as e:
+                log.warning("mailing-ended notify %s failed: %s", chat_id, e)
 
     async def _tick(self) -> tuple[bool, float]:
         """One send for one ready account into its own group list."""
