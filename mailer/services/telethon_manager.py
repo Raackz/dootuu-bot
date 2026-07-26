@@ -207,6 +207,22 @@ class TelethonManager:
         for aid in list(self._clients.keys()):
             await self.disconnect_account(aid)
 
+    async def _send_in_forum_topic(self, client: TelegramClient, entity: Any, text: str):
+        """Retry a forum send in a recent non-closed topic."""
+        messages = await client.get_messages(entity, limit=100)
+        topic_ids: list[int] = []
+        for item in messages:
+            reply = getattr(item, "reply_to", None)
+            top_id = getattr(reply, "reply_to_top_id", None)
+            if top_id and int(top_id) not in topic_ids:
+                topic_ids.append(int(top_id))
+        for topic_id in topic_ids:
+            try:
+                return await client.send_message(entity, text, reply_to=topic_id)
+            except Exception as exc:
+                if "TOPIC_CLOSED" not in str(exc):
+                    raise
+        return None
     async def send_to_group(
         self,
         account_id: int,
@@ -217,7 +233,14 @@ class TelethonManager:
         client = await self.get_client(account_id)
         try:
             entity = await client.get_entity(chat_id)
-            msg = await client.send_message(entity, text)
+            try:
+                msg = await client.send_message(entity, text)
+            except BadRequestError as exc:
+                if "TOPIC_CLOSED" not in str(exc):
+                    raise
+                msg = await self._send_in_forum_topic(client, entity, text)
+                if msg is None:
+                    raise
             title = getattr(entity, "title", None) or str(chat_id)
             return {
                 "ok": True,
@@ -251,6 +274,8 @@ class TelethonManager:
                 "PEER_ID_INVALID",
                 "You can't write in this chat",
             )
+            if "TOPIC_CLOSED" in error:
+                return {"ok": False, "error": error, "topic_closed": True}
             if any(marker in error for marker in permanent_markers):
                 return {"ok": False, "error": error, "write_forbidden": True}
             return {"ok": False, "error": error}

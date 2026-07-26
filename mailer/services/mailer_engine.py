@@ -207,7 +207,18 @@ class MailerEngine:
             error=err,
         )
         flood = result.get("flood_wait")
-        if result.get("write_forbidden"):
+        if result.get("topic_closed"):
+            await self.db.set_account_status(account["id"], "active", error=err)
+            await self._notify_account(
+                account["id"],
+                "⚠️ <b>No open forum topic</b>\n"
+                f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
+                f"Group: <b>{_esc(str(group.get('title') or group.get('chat_id')))}</b>\n"
+                "The group is a forum and its available topics are closed. "
+                "Open a topic in Telegram and sending will retry automatically.",
+            )
+            return True, delay
+        elif result.get("write_forbidden"):
             # Write restrictions are target-specific; stop this pair from retrying forever.
             await self.db.unlink_account_group(account["id"], group["id"])
             await self._notify_account(
