@@ -36,3 +36,8 @@ python -m mailer
 
 - Start command: `python -m mailer`
 - Volume (желательно): `/app/data` — чтобы sessions не слетали
+
+
+## Persistence
+
+On Railway, attach a persistent Volume mounted at /app/data and set DATA_DIR=/app/data/mailer. SQLite and Telethon sessions are stored there; without the Volume a redeploy starts with an empty database. The account menu supports multiple linked target groups and rotates through all active groups.

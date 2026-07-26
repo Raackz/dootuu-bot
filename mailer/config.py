@@ -41,7 +41,14 @@ class MailerConfig:
         self.allow_all = open_raw in ("1", "true", "yes", "on")
         self.api_id = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
         self.api_hash = (os.getenv("TG_API_HASH") or os.getenv("API_HASH") or "").strip()
-        self.data_dir = Path(os.getenv("DATA_DIR") or (BASE_DIR / "data" / "mailer"))
+        # Prefer a persistent Railway Volume when configured.
+        railway_data_dir = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+        default_data_dir = (
+            Path(railway_data_dir) / "mailer"
+            if railway_data_dir
+            else BASE_DIR / "data" / "mailer"
+        )
+        self.data_dir = Path(os.getenv("DATA_DIR") or default_data_dir)
         self.db_path = self.data_dir / "mailer.db"
         self.sessions_dir = self.data_dir / "sessions"
         self.default_cycle_limit = int(os.getenv("MAILER_CYCLE_LIMIT", "50"))

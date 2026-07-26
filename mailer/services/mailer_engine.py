@@ -51,11 +51,13 @@ class MailerEngine:
         self._stop = asyncio.Event()
         self._group_rr: dict[int, int] = {}  # account_id -> rr index
         self._account_rr: int = 0
+        self._empty_text_warned: set[int] = set()
 
     def start(self) -> None:
         if self._task and not self._task.done():
             return
         self._stop.clear()
+        self._empty_text_warned.clear()
         self._task = asyncio.create_task(self._loop(), name="mailer-engine")
         log.info("Mailer engine started")
 
@@ -128,11 +130,16 @@ class MailerEngine:
             if was_cooldown and acc["status"] == "active":
                 await self._notify_cycle_started(acc)
             text = await self.db.account_message_text(acc)
-            if not text:
-                continue
             groups = await self.db.list_account_groups(acc["id"], only_active=True)
             if not groups:
                 continue
+            if not text:
+                aid = int(acc["id"])
+                if aid not in self._empty_text_warned:
+                    await self._notify_empty_text(acc, groups)
+                    self._empty_text_warned.add(aid)
+                continue
+            self._empty_text_warned.discard(int(acc["id"]))
             ready.append(acc)
 
         if not ready:
@@ -282,6 +289,25 @@ class MailerEngine:
         if extra:
             text += f"\nError: <code>{_esc(extra)}</code>"
         await self._notify_account(account["id"], text)
+
+    async def _notify_empty_text(self, account: dict, groups: list[dict]) -> None:
+        """Report an empty configured message without sending it."""
+        label = account.get("label") or account.get("phone") or "?"
+        group_names = ", ".join(str(g.get("title") or g.get("chat_id")) for g in groups)
+        for group in groups:
+            await self.db.log_send(
+                account_id=account["id"], group_id=group["id"],
+                group_title=group.get("title") or "", group_chat_id=int(group["chat_id"]),
+                message_preview="", status="skipped", error="empty_message",
+            )
+        await self._notify_account(
+            account["id"],
+            "⚠️ <b>Sending skipped</b>\n"
+            f"Account: <b>{_esc(str(label))}</b>\n"
+            f"Targets: <b>{_esc(group_names)}</b>\n"
+            "Text: <i>(empty — nothing was sent)</i>\n"
+            "Set an account message or activate a non-empty template.",
+        )
 
     async def _notify_account(self, account_id: int, html: str) -> None:
         """Send to all log groups linked to this account."""
