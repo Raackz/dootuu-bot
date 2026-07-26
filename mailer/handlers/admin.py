@@ -283,8 +283,7 @@ async def mail_start(
     if not await _is_allowed(call, mailer_config, mailer_db):
         await _deny(call)
         return
-    if not await _mail_ready_check(call, mailer_config, mailer_db):
-        return
+    # Show duration choices first; validate accounts/API on confirmation.
     dur_def = await mailer_db.get_mailing_duration_default()
     if call.message:
         await call.message.edit_text(
