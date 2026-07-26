@@ -10,10 +10,15 @@ from typing import Any
 
 from telethon import TelegramClient
 from telethon.errors import (
+    ChatAdminRequiredError,
+    ChatForbiddenError,
+    ChatWriteForbiddenError,
+    ChannelPrivateError,
     FloodWaitError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
+    UserBannedInChannelError,
 )
 from telethon.tl.types import Channel, Chat, User
 
@@ -221,6 +226,16 @@ class TelethonManager:
             }
         except FloodWaitError as e:
             return {"ok": False, "error": f"FloodWait {e.seconds}s", "flood_wait": e.seconds}
+        except (
+            ChatWriteForbiddenError,
+            ChatAdminRequiredError,
+            ChatForbiddenError,
+            ChannelPrivateError,
+            UserBannedInChannelError,
+        ) as e:
+            # Telegram rejected this account for this target; retrying every
+            # cycle only creates a permanent failure loop.
+            return {"ok": False, "error": str(e), "write_forbidden": True}
         except Exception as e:
             log.exception("send_to_group failed account=%s chat=%s", account_id, chat_id)
             return {"ok": False, "error": str(e)}

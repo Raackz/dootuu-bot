@@ -207,7 +207,19 @@ class MailerEngine:
             error=err,
         )
         flood = result.get("flood_wait")
-        if flood:
+        if result.get("write_forbidden"):
+            # Write restrictions are target-specific; stop this pair from retrying forever.
+            await self.db.unlink_account_group(account["id"], group["id"])
+            await self._notify_account(
+                account["id"],
+                "⚠️ <b>Target disabled for this account</b>\n"
+                f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
+                f"Group: <b>{_esc(str(group.get('title') or group.get('chat_id')))}</b>\n"
+                "Telegram says this account cannot write there. The account was kept; "
+                "grant it permission or link the group to another account.",
+            )
+            await self.db.set_account_status(account["id"], "active", error=err)
+        elif flood:
             await self.db.db.execute(
                 "UPDATE accounts SET status = 'cooldown', next_cycle_at = ?, last_error = ? WHERE id = ?",
                 (time.time() + int(flood) + 5, err, account["id"]),
