@@ -16,6 +16,7 @@ def main_menu(mailing_on: bool = False) -> InlineKeyboardMarkup:
     b.row(InlineKeyboardButton(text="✉️ Сообщения", callback_data="menu:messages"))
     b.row(InlineKeyboardButton(text="🔑 API Telegram", callback_data="menu:api"))
     b.row(InlineKeyboardButton(text="⚙️ Настройки / цикл", callback_data="menu:settings"))
+    b.row(InlineKeyboardButton(text="📅 Срок рассылки (дни / месяц)", callback_data="set:duration"))
     b.row(InlineKeyboardButton(text="🧑‍🤝‍🧑 Команда", callback_data="menu:team"))
     if mailing_on:
         b.row(InlineKeyboardButton(text="⏹ Стоп рассылки", callback_data="mail:stop"))
