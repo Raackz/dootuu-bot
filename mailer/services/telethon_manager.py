@@ -10,6 +10,7 @@ from typing import Any
 
 from telethon import TelegramClient
 from telethon.errors import (
+    BadRequestError,
     ChatAdminRequiredError,
     ChatForbiddenError,
     ChatWriteForbiddenError,
@@ -236,6 +237,23 @@ class TelethonManager:
             # Telegram rejected this account for this target; retrying every
             # cycle only creates a permanent failure loop.
             return {"ok": False, "error": str(e), "write_forbidden": True}
+        except BadRequestError as e:
+            # Some permanent target failures are returned as generic 400 errors,
+            # e.g. TOPIC_CLOSED, instead of a dedicated Telethon exception.
+            error = str(e)
+            permanent_markers = (
+                "TOPIC_CLOSED",
+                "CHAT_WRITE_FORBIDDEN",
+                "CHAT_FORBIDDEN",
+                "USER_BANNED_IN_CHANNEL",
+                "CHANNEL_PRIVATE",
+                "CHANNEL_INVALID",
+                "PEER_ID_INVALID",
+                "You can't write in this chat",
+            )
+            if any(marker in error for marker in permanent_markers):
+                return {"ok": False, "error": error, "write_forbidden": True}
+            return {"ok": False, "error": error}
         except Exception as e:
             log.exception("send_to_group failed account=%s chat=%s", account_id, chat_id)
             return {"ok": False, "error": str(e)}
