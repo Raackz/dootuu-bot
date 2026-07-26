@@ -551,7 +551,7 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
         f"{'' if own_pause else ' <i>(глоб.)</i>'}\n"
         f"• Delay: <b>{delay}</b> сек"
         f"{'' if own_delay else ' <i>(глоб.)</i>'}"
-        f"\nTerm: <b>{duration_label}</b>",
+        f"\nTerm: <b>{duration_label}</b>"
     )
 
 
