@@ -119,9 +119,13 @@ class MailerEngine:
 
         ready: list[dict] = []
         for acc in accounts:
-            if acc["status"] in ("disabled", "error"):
+            if acc["status"] in ("disabled", "error", "expired"):
                 continue
             was_cooldown = acc["status"] == "cooldown"
+            if await self.db.account_duration_expired(acc):
+                await self.db.set_account_status(acc["id"], "expired", error="account term expired")
+                await self._notify_account_duration_ended(acc)
+                continue
             if not await self.db.maybe_end_cooldown(acc["id"]):
                 continue
             acc = await self.db.get_account(acc["id"])
@@ -289,6 +293,15 @@ class MailerEngine:
         if extra:
             text += f"\nError: <code>{_esc(extra)}</code>"
         await self._notify_account(account["id"], text)
+
+    async def _notify_account_duration_ended(self, account: dict) -> None:
+        label = account.get("label") or account.get("phone") or "?"
+        await self._notify_account(
+            account["id"],
+            "⏹ <b>Account term expired</b>\n"
+            f"Account: <b>{_esc(str(label))}</b>\n"
+            "This account was stopped automatically; other accounts continue.",
+        )
 
     async def _notify_empty_text(self, account: dict, groups: list[dict]) -> None:
         """Report an empty configured message without sending it."""

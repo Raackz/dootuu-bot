@@ -126,6 +126,8 @@ class MailerDB:
         await self._ensure_column("accounts", "delay_sec", "REAL")
         await self._ensure_column("accounts", "added_by", "INTEGER")
         await self._ensure_column("accounts", "client_label", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("accounts", "mailing_duration_sec", "INTEGER NOT NULL DEFAULT 0")
+        await self._ensure_column("accounts", "mailing_ends_at", "REAL")
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
@@ -448,6 +450,42 @@ class MailerDB:
             except (TypeError, ValueError):
                 pass
         return await self.get_float("delay_sec", 8.0)
+
+    async def account_duration(self, account: dict[str, Any]) -> int:
+        """Per-account duration in seconds; 0 means unlimited."""
+        try:
+            return max(0, int(account.get("mailing_duration_sec") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    async def account_time_left(self, account: dict[str, Any]) -> float | None:
+        ends = account.get("mailing_ends_at")
+        if ends is None or str(ends).strip() == "":
+            return None
+        try:
+            return max(0.0, float(ends) - time.time())
+        except (TypeError, ValueError):
+            return None
+
+    async def account_duration_expired(self, account: dict[str, Any]) -> bool:
+        ends = account.get("mailing_ends_at")
+        if ends is None or str(ends).strip() == "":
+            return False
+        try:
+            return time.time() >= float(ends)
+        except (TypeError, ValueError):
+            return False
+
+    async def set_account_duration(self, account_id: int, duration_sec: int) -> None:
+        sec = max(0, int(duration_sec))
+        ends = time.time() + sec if sec > 0 else None
+        await self.db.execute(
+            "UPDATE accounts SET mailing_duration_sec = ?, mailing_ends_at = ?, "
+            "status = CASE WHEN status = 'expired' THEN 'active' ELSE status END "
+            "WHERE id = ?",
+            (sec, ends, account_id),
+        )
+        await self.db.commit()
 
     async def mark_sent(self, account_id: int) -> dict[str, Any]:
         """Increment cycle counter; if limit reached — schedule next cycle."""

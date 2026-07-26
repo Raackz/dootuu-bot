@@ -143,7 +143,7 @@ def account_card(account_id: int, status: str) -> InlineKeyboardMarkup:
             callback_data=f"acc:params:{account_id}",
         )
     )
-    if status == "disabled":
+    if status in ("disabled", "expired"):
         b.row(InlineKeyboardButton(text="Включить", callback_data=f"acc:enable:{account_id}"))
     else:
         b.row(InlineKeyboardButton(text="Выключить", callback_data=f"acc:disable:{account_id}"))
@@ -249,6 +249,12 @@ def account_params_menu(account_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text="⏳ Задержка между сообщениями (сек)",
             callback_data=f"acc:setdelay:{account_id}",
+        )
+    )
+    b.row(
+        InlineKeyboardButton(
+            text="Account term (days / month)",
+            callback_data=f"acc:setduration:{account_id}",
         )
     )
     b.row(

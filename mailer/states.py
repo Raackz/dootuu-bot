@@ -32,6 +32,7 @@ class SettingsStates(StatesGroup):
     cycle_limit = State()
     cycle_pause = State()
     delay = State()
+    duration = State()
     log_group = State()
     api_id = State()
     api_hash = State()
@@ -43,6 +44,7 @@ class AccountConfigStates(StatesGroup):
     cycle_limit = State()
     cycle_pause = State()
     delay = State()
+    duration = State()
 
 
 class TeamStates(StatesGroup):

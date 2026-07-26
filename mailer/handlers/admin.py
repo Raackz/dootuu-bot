@@ -522,6 +522,9 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
     own_lim = acc.get("cycle_limit") is not None
     own_pause = acc.get("cycle_pause_sec") is not None
     own_delay = acc.get("delay_sec") is not None
+    duration = await mailer_db.account_duration(acc)
+    left = await mailer_db.account_time_left(acc)
+    duration_label = "unlimited" if duration <= 0 else (_fmt_left_ru(int(left)) if left is not None else "expired")
     msg = await mailer_db.account_message_text(acc)
     own_msg = bool((acc.get("message_text") or "").strip())
     preview = (msg[:120] + "…") if len(msg) > 120 else msg
@@ -548,6 +551,7 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
         f"{'' if own_pause else ' <i>(глоб.)</i>'}\n"
         f"• Delay: <b>{delay}</b> сек"
         f"{'' if own_delay else ' <i>(глоб.)</i>'}"
+        f"\nTerm: <b>{duration_label}</b>",
     )
 
 
@@ -702,6 +706,35 @@ async def acc_params(
             parse_mode="HTML",
         )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("acc:setduration:"))
+async def acc_set_duration(call: CallbackQuery, mailer_config: MailerConfig, mailer_db: MailerDB) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    acc = await mailer_db.get_account(aid)
+    current = await mailer_db.account_duration(acc or {})
+    if call.message:
+        await call.message.edit_text(
+            "<b>Account term</b>\nChoose duration for this account only.\n\"Unlimited\" removes the deadline.",
+            reply_markup=kb.mail_duration_menu(prefix=f"acc:dur:{aid}", back=f"acc:params:{aid}", selected=current),
+            parse_mode="HTML",
+        )
+    await call.answer()
+
+@router.callback_query(F.data.startswith("acc:dur:"))
+async def acc_set_duration_value(call: CallbackQuery, mailer_config: MailerConfig, mailer_db: MailerDB) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    parts = call.data.split(":")  # type: ignore[union-attr]
+    aid, duration = int(parts[2]), int(parts[3])
+    await mailer_db.set_account_duration(aid, duration)
+    await call.answer("Account term updated")
+    call.data = f"acc:params:{aid}"
+    await acc_params(call, mailer_config, mailer_db)
 
 
 @router.callback_query(F.data.startswith("acc:setlim:"))
@@ -867,6 +900,7 @@ async def acc_reset_params(
     await mailer_db.set_account_param(
         aid, cycle_limit=None, cycle_pause_sec=None, delay_sec=None
     )
+    await mailer_db.set_account_duration(aid, 0)
     await call.answer("Параметры сброшены")
     call.data = f"acc:params:{aid}"
     await acc_params(call, mailer_config, mailer_db)
