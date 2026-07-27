@@ -208,6 +208,14 @@ class MailerDB:
         )
         await self.db.commit()
 
+        # Recover old queued/permanent failures after fixing global pool links.
+        await self.db.execute(
+            "UPDATE account_group_joins "
+            "SET status = 'queued', next_attempt_at = 0, last_error = NULL "
+            "WHERE status <> 'joined'"
+        )
+        await self.db.commit()
+
         # if no account_log_groups, attach all log_groups to all accounts
         cur = await self.db.execute("SELECT COUNT(*) AS c FROM account_log_groups")
         row = await cur.fetchone()
