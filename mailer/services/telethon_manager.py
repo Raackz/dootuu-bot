@@ -279,10 +279,20 @@ class TelethonManager:
         client = await self.get_client(account_id)
         try:
             entity = await client.get_entity(chat_id)
+            source_peer = source_chat_id
+            if source_chat_id is not None and source_message_id is not None:
+                try:
+                    source_peer = await client.get_entity(source_chat_id)
+                except (TypeError, ValueError) as exc:
+                    # The account cannot resolve the source chat. Fall back to
+                    # the HTML representation so custom emoji are retained.
+                    log.warning("source chat unavailable for account=%s chat=%s: %s", account_id, source_chat_id, exc)
+                    source_chat_id = None
+                    source_message_id = None
             try:
                 if source_chat_id is not None and source_message_id is not None:
                     forwarded = await client.forward_messages(
-                        entity, source_message_id, from_peer=source_chat_id
+                        entity, source_message_id, from_peer=source_peer
                     )
                     msg = forwarded[0] if isinstance(forwarded, (list, tuple)) else forwarded
                 else:
