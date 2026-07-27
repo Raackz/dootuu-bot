@@ -132,6 +132,8 @@ class MailerDB:
         await self.db.commit()
         # per-account message + params (nullable = use global defaults)
         await self._ensure_column("accounts", "message_text", "TEXT NOT NULL DEFAULT ''")
+        await self._ensure_column("accounts", "message_source_chat_id", "INTEGER")
+        await self._ensure_column("accounts", "message_source_id", "INTEGER")
         await self._ensure_column("accounts", "cycle_limit", "INTEGER")
         await self._ensure_column("accounts", "cycle_pause_sec", "INTEGER")
         await self._ensure_column("accounts", "delay_sec", "REAL")
@@ -139,6 +141,8 @@ class MailerDB:
         await self._ensure_column("accounts", "client_label", "TEXT NOT NULL DEFAULT ''")
         await self._ensure_column("accounts", "mailing_duration_sec", "INTEGER NOT NULL DEFAULT 0")
         await self._ensure_column("accounts", "mailing_ends_at", "REAL")
+        await self._ensure_column("messages", "source_chat_id", "INTEGER")
+        await self._ensure_column("messages", "source_message_id", "INTEGER")
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
@@ -407,10 +411,13 @@ class MailerDB:
         )
         await self.db.commit()
 
-    async def set_account_message(self, account_id: int, text: str) -> None:
+    async def set_account_message(
+        self, account_id: int, text: str, source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> None:
         await self.db.execute(
-            "UPDATE accounts SET message_text = ? WHERE id = ?",
-            (text or "", account_id),
+            "UPDATE accounts SET message_text = ?, message_source_chat_id = ?, message_source_id = ? WHERE id = ?",
+            (text or "", source_chat_id, source_message_id, account_id),
         )
         await self.db.commit()
 
@@ -453,6 +460,15 @@ class MailerDB:
             return own
         msg = await self.get_active_message()
         return ((msg or {}).get("text") or "").strip()
+
+    async def account_message(self, account: dict[str, Any]) -> dict[str, Any]:
+        """Return the configured message, including an optional source message."""
+        own = (account.get("message_text") or "").strip()
+        own_source_chat_id = account.get("message_source_chat_id")
+        own_source_id = account.get("message_source_id")
+        if own or (own_source_chat_id and own_source_id):
+            return {"text": own, "source_chat_id": own_source_chat_id, "source_message_id": own_source_id}
+        return (await self.get_active_message()) or {}
 
     async def account_cycle_limit(self, account: dict[str, Any]) -> int:
         v = account.get("cycle_limit")
@@ -792,18 +808,24 @@ class MailerDB:
         row = await cur.fetchone()
         return dict(row) if row else None
 
-    async def update_message_text(self, message_id: int, text: str) -> None:
+    async def update_message_text(
+        self, message_id: int, text: str, source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> None:
         await self.db.execute(
-            "UPDATE messages SET text = ?, updated_at = ? WHERE id = ?",
-            (text, time.time(), message_id),
+            "UPDATE messages SET text = ?, source_chat_id = ?, source_message_id = ?, updated_at = ? WHERE id = ?",
+            (text, source_chat_id, source_message_id, time.time(), message_id),
         )
         await self.db.commit()
 
-    async def add_message(self, title: str, text: str) -> int:
+    async def add_message(
+        self, title: str, text: str, source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> int:
         now = time.time()
         cur = await self.db.execute(
-            "INSERT INTO messages (title, text, active, updated_at, created_at) VALUES (?, ?, 1, ?, ?)",
-            (title, text, now, now),
+            "INSERT INTO messages (title, text, source_chat_id, source_message_id, active, updated_at, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (title, text, source_chat_id, source_message_id, now, now),
         )
         await self.db.commit()
         return int(cur.lastrowid)

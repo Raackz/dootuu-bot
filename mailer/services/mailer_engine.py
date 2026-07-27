@@ -85,8 +85,14 @@ class MailerEngine:
                     await self._notify_mailing_ended()
                     await asyncio.sleep(2)
                     continue
+                # The configured delay is the interval between send attempts.
+                # Do not add it on top of the time spent inside Telethon: a
+                # slow Telegram request would otherwise turn a 15s delay into
+                # 45-60s between messages.
+                tick_started = time.monotonic()
                 did_work, delay = await self._tick()
-                await asyncio.sleep(join_delay if join_work else (delay if did_work else 3.0))
+                elapsed = time.monotonic() - tick_started
+                await asyncio.sleep(join_delay if join_work else (max(0.0, delay - elapsed) if did_work else 3.0))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -162,11 +168,13 @@ class MailerEngine:
                 continue
             if was_cooldown and acc["status"] == "active":
                 await self._notify_cycle_started(acc)
-            text = await self.db.account_message_text(acc)
+            message = await self.db.account_message(acc)
+            text = (message.get("text") or "").strip()
+            has_source = bool(message.get("source_chat_id") and message.get("source_message_id"))
             groups = await self.db.list_account_groups(acc["id"], only_active=True)
             if not groups:
                 continue
-            if not text:
+            if not text and not has_source:
                 aid = int(acc["id"])
                 if aid not in self._empty_text_warned:
                     await self._notify_empty_text(acc, groups)
@@ -193,12 +201,16 @@ class MailerEngine:
         group = groups[g_idx]
         self._group_rr[aid] = (g_idx + 1) % len(groups)
 
-        text = await self.db.account_message_text(account)
+        message = await self.db.account_message(account)
+        text = (message.get("text") or "").strip()
+        source_chat_id = message.get("source_chat_id")
+        source_message_id = message.get("source_message_id")
         delay = await self.db.account_delay(account)
         cycle_limit = await self.db.account_cycle_limit(account)
 
         result = await self.telethon.send_to_group(
-            account["id"], int(group["chat_id"]), text
+            account["id"], int(group["chat_id"]), text,
+            source_chat_id=source_chat_id, source_message_id=source_message_id,
         )
 
         preview = (text[:80] + "…") if len(text) > 80 else text
@@ -244,7 +256,8 @@ class MailerEngine:
                 f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
                 f"Group: <b>{_esc(str(group.get('title') or group.get('chat_id')))}</b>\n"
                 "The group is a forum and its available topics are closed. "
-                "Open a topic in Telegram and sending will retry automatically.",
+                "The bot will try to create a new Broadcast topic automatically. "
+                "If Telegram denies this, open a topic manually or grant the account topic-management rights.",
             )
             return True, delay
         elif result.get("write_forbidden"):

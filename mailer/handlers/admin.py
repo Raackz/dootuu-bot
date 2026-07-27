@@ -92,6 +92,20 @@ def _fmt_duration_choice(sec: int) -> str:
     return f"{h} ч" if h != 1 else "1 час"
 
 
+def _source_message_ref(message: Message) -> tuple[int | None, int | None]:
+    """Get source chat/message IDs from a forwarded Telegram message."""
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None)
+    source_chat_id = getattr(chat, "id", None)
+    source_message_id = getattr(origin, "message_id", None)
+    if source_chat_id is None:
+        legacy_chat = getattr(message, "forward_from_chat", None)
+        source_chat_id = getattr(legacy_chat, "id", None)
+        source_message_id = getattr(message, "forward_from_message_id", None)
+    if source_chat_id is None or source_message_id is None:
+        return None, None
+    return int(source_chat_id), int(source_message_id)
+
 async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
     st = await db.stats()
     cycle = await db.get_int("cycle_limit", 50)
@@ -253,9 +267,11 @@ async def _mail_ready_check(
         return False
     ready = 0
     for a in accounts:
-        text = await mailer_db.account_message_text(a)
+        configured = await mailer_db.account_message(a)
+        text = (configured.get("text") or "").strip()
+        has_source = bool(configured.get("source_chat_id") and configured.get("source_message_id"))
         grps = await mailer_db.list_account_groups(a["id"], only_active=True)
-        if text and grps:
+        if (text or has_source) and grps:
             ready += 1
     if ready == 0:
         await call.answer(
@@ -665,10 +681,11 @@ async def acc_msg_edit_text(
     data = await state.get_data()
     aid = int(data["account_id"])
     text = _message_content(message)
-    if not text.strip():
-        await message.answer("Пустой текст")
+    source_chat_id, source_message_id = _source_message_ref(message)
+    if not text.strip() and source_chat_id is None:
+        await message.answer("Пришли текст или перешли исходное сообщение")
         return
-    await mailer_db.set_account_message(aid, text)
+    await mailer_db.set_account_message(aid, text, source_chat_id, source_message_id)
     await state.clear()
     await message.answer(
         f"✅ Сообщение для аккаунта #{aid} сохранено",
@@ -1267,10 +1284,11 @@ async def msg_edit_text(
     data = await state.get_data()
     mid = int(data["message_id"])
     text = _message_content(message)
-    if not text.strip():
-        await message.answer("Пустой текст")
+    source_chat_id, source_message_id = _source_message_ref(message)
+    if not text.strip() and source_chat_id is None:
+        await message.answer("Пришли текст или перешли исходное сообщение")
         return
-    await mailer_db.update_message_text(mid, text)
+    await mailer_db.update_message_text(mid, text, source_chat_id, source_message_id)
     await state.clear()
     await message.answer("✅ Текст обновлён", reply_markup=kb.back_main())
 
@@ -1338,7 +1356,11 @@ async def msg_new_text(
         return
     data = await state.get_data()
     text = _message_content(message)
-    mid = await mailer_db.add_message(data.get("title") or "template", text)
+    source_chat_id, source_message_id = _source_message_ref(message)
+    if not text.strip() and source_chat_id is None:
+        await message.answer("Пришли текст или перешли исходное сообщение")
+        return
+    mid = await mailer_db.add_message(data.get("title") or "template", text, source_chat_id, source_message_id)
     await mailer_db.set_active_message(mid)
     await state.clear()
     await message.answer(

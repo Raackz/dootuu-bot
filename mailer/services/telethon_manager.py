@@ -25,7 +25,7 @@ from telethon.errors import (
     InviteHashInvalidError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import CreateForumTopicRequest, ForwardMessagesRequest, ImportChatInviteRequest
 from telethon.tl.types import Channel, Chat, User
 
 from mailer.config import MailerConfig
@@ -212,38 +212,87 @@ class TelethonManager:
         for aid in list(self._clients.keys()):
             await self.disconnect_account(aid)
 
-    async def _send_in_forum_topic(self, client: TelegramClient, entity: Any, text: str):
-        """Retry a forum send in a recent non-closed topic."""
-        messages = await client.get_messages(entity, limit=100)
-        topic_ids: list[int] = []
-        for item in messages:
-            reply = getattr(item, "reply_to", None)
-            top_id = getattr(reply, "reply_to_top_id", None)
-            if top_id and int(top_id) not in topic_ids:
-                topic_ids.append(int(top_id))
-        for topic_id in topic_ids:
-            try:
-                return await client.send_message(entity, text, reply_to=topic_id, parse_mode=("html" if "<tg-emoji " in text else None))
-            except Exception as exc:
-                if "TOPIC_CLOSED" not in str(exc):
-                    raise
-        return None
+    async def _send_in_forum_topic(
+        self, client: TelegramClient, entity: Any, text: str,
+        source_chat_id: int | None = None, source_message_id: int | None = None,
+    ):
+        """Send to an open forum topic, creating one when needed."""
+        async def topic_ids() -> list[int]:
+            messages = await client.get_messages(entity, limit=100)
+            ids: list[int] = []
+            for item in messages:
+                reply = getattr(item, "reply_to", None)
+                top_id = getattr(reply, "reply_to_top_id", None)
+                action = getattr(item, "action", None)
+                if top_id:
+                    candidate = int(top_id)
+                elif action and action.__class__.__name__ == "MessageActionTopicCreate":
+                    candidate = int(item.id)
+                else:
+                    continue
+                if candidate not in ids:
+                    ids.append(candidate)
+            return ids
+
+        async def try_topics(ids: list[int]):
+            for topic_id in ids:
+                try:
+                    if source_chat_id is not None and source_message_id is not None:
+                        updates = await client(ForwardMessagesRequest(
+                            from_peer=source_chat_id, id=[source_message_id],
+                            to_peer=entity, top_msg_id=topic_id,
+                        ))
+                        for update in getattr(updates, "updates", []):
+                            forwarded = getattr(update, "message", None)
+                            if forwarded is not None:
+                                return forwarded
+                        latest = await client.get_messages(entity, limit=1)
+                        return latest[0] if latest else None
+                    return await client.send_message(
+                        entity, text, reply_to=topic_id,
+                        parse_mode=("html" if "<tg-emoji " in text else None),
+                    )
+                except Exception as exc:
+                    if "TOPIC_CLOSED" not in str(exc):
+                        raise
+            return None
+
+        msg = await try_topics(await topic_ids())
+        if msg is not None:
+            return msg
+        try:
+            await client(CreateForumTopicRequest(entity, title="Broadcast"))
+            await asyncio.sleep(0.5)
+            return await try_topics(await topic_ids())
+        except Exception as exc:
+            log.warning("could not create forum topic for %s: %s", entity, exc)
+            return None
     async def send_to_group(
         self,
         account_id: int,
         chat_id: int,
         text: str,
+        source_chat_id: int | None = None,
+        source_message_id: int | None = None,
     ) -> dict[str, Any]:
-        """Send text message as account into a group. Returns result dict."""
+        """Send a text or forward a source message as account into a group."""
         client = await self.get_client(account_id)
         try:
             entity = await client.get_entity(chat_id)
             try:
-                msg = await client.send_message(entity, text, parse_mode=("html" if "<tg-emoji " in text else None))
+                if source_chat_id is not None and source_message_id is not None:
+                    forwarded = await client.forward_messages(
+                        entity, source_message_id, from_peer=source_chat_id
+                    )
+                    msg = forwarded[0] if isinstance(forwarded, (list, tuple)) else forwarded
+                else:
+                    msg = await client.send_message(entity, text, parse_mode=("html" if "<tg-emoji " in text else None))
             except BadRequestError as exc:
                 if "TOPIC_CLOSED" not in str(exc):
                     raise
-                msg = await self._send_in_forum_topic(client, entity, text)
+                msg = await self._send_in_forum_topic(
+                    client, entity, text, source_chat_id, source_message_id
+                )
                 if msg is None:
                     raise
             title = getattr(entity, "title", None) or str(chat_id)
