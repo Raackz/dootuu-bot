@@ -52,6 +52,8 @@ async def _run() -> None:
         await db.set_setting("delay_sec", str(config.default_delay_sec))
     if (await db.get_setting("join_pause_sec", "")) == "":
         await db.set_setting("join_pause_sec", str(config.default_join_pause_sec))
+    elif (await db.get_setting("join_pause_sec", "")) == "300":
+        await db.set_setting("join_pause_sec", "60")
 
     # API credentials: DB (set via bot) overrides env
     db_api_id = (await db.get_setting("tg_api_id", "")).strip()

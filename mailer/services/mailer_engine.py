@@ -104,7 +104,7 @@ class MailerEngine:
         group_id = int(item["group_id"])
         ref = (item.get("group_username") or "").strip() or str(item["chat_id"])
         result = await self.telethon.join_group(account_id, ref)
-        pause = max(30, await self.db.get_int("join_pause_sec", 300))
+        pause = max(30, await self.db.get_int("join_pause_sec", 60))
         if result.get("ok"):
             await self.db.record_group_join(account_id, group_id, status="joined")
             log.info("account=%s joined group=%s", account_id, group_id)

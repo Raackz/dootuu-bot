@@ -148,7 +148,7 @@ class MailerDB:
             "cycle_limit": "50",
             "cycle_pause_sec": "3600",
             "delay_sec": "8",
-            "join_pause_sec": "300",
+            "join_pause_sec": "60",
             "active_message_id": "",
         }
         for k, v in defaults.items():

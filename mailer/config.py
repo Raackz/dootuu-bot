@@ -25,7 +25,7 @@ class MailerConfig:
     default_cycle_limit: int = 50
     default_cycle_pause_sec: int = 3600
     default_delay_sec: float = 8.0
-    default_join_pause_sec: int = 300
+    default_join_pause_sec: int = 60
     # If true — любой, кто открыл бота, может добавлять аккаунты и управлять
     allow_all: bool = True
 
@@ -55,7 +55,7 @@ class MailerConfig:
         self.default_cycle_limit = int(os.getenv("MAILER_CYCLE_LIMIT", "50"))
         self.default_cycle_pause_sec = int(os.getenv("MAILER_CYCLE_PAUSE_SEC", "3600"))
         self.default_delay_sec = float(os.getenv("MAILER_DELAY_SEC", "8"))
-        self.default_join_pause_sec = max(30, int(os.getenv("MAILER_JOIN_PAUSE_SEC", "300")))
+        self.default_join_pause_sec = max(30, int(os.getenv("MAILER_JOIN_PAUSE_SEC", "60")))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
