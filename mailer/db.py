@@ -116,6 +116,17 @@ class MailerDB:
                 log_group_id INTEGER NOT NULL,
                 PRIMARY KEY (account_id, log_group_id)
             );
+
+            CREATE TABLE IF NOT EXISTS account_group_joins (
+                account_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_attempt_at REAL,
+                joined_at REAL,
+                last_error TEXT,
+                PRIMARY KEY (account_id, group_id)
+            );
             """
         )
         await self.db.commit()
@@ -137,6 +148,7 @@ class MailerDB:
             "cycle_limit": "50",
             "cycle_pause_sec": "3600",
             "delay_sec": "8",
+            "join_pause_sec": "300",
             "active_message_id": "",
         }
         for k, v in defaults.items():
@@ -625,6 +637,43 @@ class MailerDB:
             (account_id, group_id),
         )
         return (await cur.fetchone()) is not None
+
+    async def list_group_join_queue(self, now: float, limit: int = 1) -> list[dict[str, Any]]:
+        cur = await self.db.execute(
+            "SELECT a.*, g.id AS group_id, g.chat_id, g.title AS group_title, "
+            "g.username AS group_username, agj.status AS join_status "
+            "FROM account_groups ag "
+            "JOIN accounts a ON a.id = ag.account_id "
+            "JOIN groups g ON g.id = ag.group_id "
+            "LEFT JOIN account_group_joins agj "
+            "ON agj.account_id = ag.account_id AND agj.group_id = ag.group_id "
+            "WHERE a.status NOT IN ('disabled', 'error', 'expired') "
+            "AND g.active = 1 "
+            "AND COALESCE(agj.status, 'queued') NOT IN ('joined', 'permanent_error') "
+            "AND COALESCE(agj.next_attempt_at, 0) <= ? "
+            "ORDER BY COALESCE(agj.next_attempt_at, 0), a.id, g.id LIMIT ?",
+            (now, max(1, int(limit))),
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+    async def record_group_join(
+        self, account_id: int, group_id: int, *, status: str,
+        next_attempt_at: float = 0, error: str | None = None,
+    ) -> None:
+        now = time.time()
+        joined_at = now if status == "joined" else None
+        await self.db.execute(
+            "INSERT INTO account_group_joins "
+            "(account_id, group_id, status, next_attempt_at, last_attempt_at, joined_at, last_error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(account_id, group_id) DO UPDATE SET "
+            "status=excluded.status, next_attempt_at=excluded.next_attempt_at, "
+            "last_attempt_at=excluded.last_attempt_at, "
+            "joined_at=COALESCE(excluded.joined_at, account_group_joins.joined_at), "
+            "last_error=excluded.last_error",
+            (account_id, group_id, status, float(next_attempt_at), now, joined_at, error),
+        )
+        await self.db.commit()
 
     # ── log groups (multi) ────────────────────────────────────
 

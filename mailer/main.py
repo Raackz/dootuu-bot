@@ -50,6 +50,8 @@ async def _run() -> None:
         await db.set_setting("cycle_pause_sec", str(config.default_cycle_pause_sec))
     if (await db.get_setting("delay_sec", "")) == "":
         await db.set_setting("delay_sec", str(config.default_delay_sec))
+    if (await db.get_setting("join_pause_sec", "")) == "":
+        await db.set_setting("join_pause_sec", str(config.default_join_pause_sec))
 
     # API credentials: DB (set via bot) overrides env
     db_api_id = (await db.get_setting("tg_api_id", "")).strip()
@@ -77,8 +79,9 @@ async def _run() -> None:
     dp["mailer_engine"] = engine
     dp.include_router(setup_routers())
 
+    # Auto-join must continue even while broadcasting is disabled.
+    engine.start()
     if await db.is_mailing_enabled():
-        engine.start()
         log.info("Resumed mailing engine (was enabled in DB)")
 
     me = await bot.get_me()

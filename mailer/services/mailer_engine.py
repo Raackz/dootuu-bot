@@ -75,8 +75,9 @@ class MailerEngine:
     async def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                join_work, join_delay = await self._process_one_join()
                 if not await self.db.is_mailing_enabled():
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(join_delay if join_work else 2)
                     continue
                 # auto-stop when selected duration expires
                 if await self.db.check_and_expire_mailing():
@@ -85,12 +86,40 @@ class MailerEngine:
                     await asyncio.sleep(2)
                     continue
                 did_work, delay = await self._tick()
-                await asyncio.sleep(delay if did_work else 3.0)
+                await asyncio.sleep(join_delay if join_work else (delay if did_work else 3.0))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("mailer loop error")
                 await asyncio.sleep(5)
+
+    async def _process_one_join(self) -> tuple[bool, float]:
+        """Join one linked target at a time and persist the next attempt."""
+        now = time.time()
+        queue = await self.db.list_group_join_queue(now, limit=1)
+        if not queue:
+            return False, 0.0
+        item = queue[0]
+        account_id = int(item["id"])
+        group_id = int(item["group_id"])
+        ref = (item.get("group_username") or "").strip() or str(item["chat_id"])
+        result = await self.telethon.join_group(account_id, ref)
+        pause = max(30, await self.db.get_int("join_pause_sec", 300))
+        if result.get("ok"):
+            await self.db.record_group_join(account_id, group_id, status="joined")
+            log.info("account=%s joined group=%s", account_id, group_id)
+        elif result.get("permanent"):
+            await self.db.record_group_join(
+                account_id, group_id, status="permanent_error", error=result.get("error")
+            )
+            log.warning("account=%s cannot join group=%s: %s", account_id, group_id, result.get("error"))
+        else:
+            wait = max(pause, int(result.get("flood_wait") or 0) + 30)
+            await self.db.record_group_join(
+                account_id, group_id, status="queued",
+                next_attempt_at=now + wait, error=result.get("error"),
+            )
+        return True, pause
 
     async def _notify_mailing_ended(self) -> None:
         """Tell every active log group that the timed broadcast finished."""

@@ -20,7 +20,12 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     SessionPasswordNeededError,
     UserBannedInChannelError,
+    UserAlreadyParticipantError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
 )
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import Channel, Chat, User
 
 from mailer.config import MailerConfig
@@ -282,6 +287,35 @@ class TelethonManager:
         except Exception as e:
             log.exception("send_to_group failed account=%s chat=%s", account_id, chat_id)
             return {"ok": False, "error": str(e)}
+
+    async def join_group(self, account_id: int, ref: str) -> dict[str, Any]:
+        """Join a public group/channel or invite link for one account."""
+        client = await self.get_client(account_id)
+        ref = (ref or "").strip()
+        try:
+            if "t.me/+" in ref or "t.me/joinchat/" in ref:
+                invite_hash = ref.rstrip("/").split("/")[-1].split("+")[-1]
+                await client(ImportChatInviteRequest(invite_hash))
+                return {"ok": True, "already": False}
+
+            entity_ref: Any = int(ref) if re.fullmatch(r"-?\d+", ref) else ref.lstrip("@")
+            entity = await client.get_entity(entity_ref)
+            if isinstance(entity, User):
+                return {"ok": False, "permanent": True, "error": "target is a user"}
+            if isinstance(entity, Channel):
+                await client(JoinChannelRequest(entity))
+                return {"ok": True, "already": False}
+            # Basic chats returned here are already in the account's dialogs.
+            return {"ok": True, "already": True}
+        except UserAlreadyParticipantError:
+            return {"ok": True, "already": True}
+        except FloodWaitError as exc:
+            return {"ok": False, "flood_wait": int(exc.seconds), "error": f"FloodWait {exc.seconds}s"}
+        except (InviteHashExpiredError, InviteHashInvalidError, ChannelPrivateError) as exc:
+            return {"ok": False, "permanent": True, "error": str(exc)}
+        except Exception as exc:
+            log.warning("join_group failed account=%s ref=%s: %s", account_id, ref, exc)
+            return {"ok": False, "error": str(exc)}
 
     async def resolve_group(self, account_id: int, ref: str) -> dict[str, Any]:
         """
