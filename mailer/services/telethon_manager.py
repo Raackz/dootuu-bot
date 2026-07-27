@@ -223,7 +223,7 @@ class TelethonManager:
                 topic_ids.append(int(top_id))
         for topic_id in topic_ids:
             try:
-                return await client.send_message(entity, text, reply_to=topic_id)
+                return await client.send_message(entity, text, reply_to=topic_id, parse_mode=("html" if "<tg-emoji " in text else None))
             except Exception as exc:
                 if "TOPIC_CLOSED" not in str(exc):
                     raise
@@ -239,7 +239,7 @@ class TelethonManager:
         try:
             entity = await client.get_entity(chat_id)
             try:
-                msg = await client.send_message(entity, text)
+                msg = await client.send_message(entity, text, parse_mode=("html" if "<tg-emoji " in text else None))
             except BadRequestError as exc:
                 if "TOPIC_CLOSED" not in str(exc):
                     raise

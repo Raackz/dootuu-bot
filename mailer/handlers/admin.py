@@ -555,6 +555,17 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
     )
 
 
+def _message_content(message: Message) -> str:
+    """Keep Telegram formatting, including Premium Emoji, as HTML."""
+    return (
+        getattr(message, "html_text", None)
+        or getattr(message, "html_caption", None)
+        or message.text
+        or message.caption
+        or ""
+    )
+
+
 def _html_esc(s: str) -> str:
     return (
         (s or "")
@@ -653,7 +664,7 @@ async def acc_msg_edit_text(
         return
     data = await state.get_data()
     aid = int(data["account_id"])
-    text = message.text or message.caption or ""
+    text = _message_content(message)
     if not text.strip():
         await message.answer("Пустой текст")
         return
@@ -1255,7 +1266,7 @@ async def msg_edit_text(
         return
     data = await state.get_data()
     mid = int(data["message_id"])
-    text = message.text or message.caption or ""
+    text = _message_content(message)
     if not text.strip():
         await message.answer("Пустой текст")
         return
@@ -1326,7 +1337,7 @@ async def msg_new_text(
         await _deny(message)
         return
     data = await state.get_data()
-    text = message.text or message.caption or ""
+    text = _message_content(message)
     mid = await mailer_db.add_message(data.get("title") or "template", text)
     await mailer_db.set_active_message(mid)
     await state.clear()
