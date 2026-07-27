@@ -25,7 +25,7 @@ from telethon.errors import (
     InviteHashInvalidError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import CreateForumTopicRequest, ForwardMessagesRequest, ImportChatInviteRequest
+from telethon.tl.functions.messages import CreateForumTopicRequest, ForwardMessagesRequest, GetForumTopicsRequest, ImportChatInviteRequest
 from telethon.tl.types import Channel, Chat, User
 
 from mailer.config import MailerConfig
@@ -218,6 +218,23 @@ class TelethonManager:
     ):
         """Send to an open forum topic, creating one when needed."""
         async def topic_ids() -> list[int]:
+            # Ask Telegram for the actual forum-topic state. Message history
+            # can contain only closed topics and is not authoritative.
+            try:
+                result = await client(GetForumTopicsRequest(
+                    peer=entity, offset_date=None, offset_id=0,
+                    offset_topic=0, limit=100,
+                ))
+                return [
+                    int(topic.id)
+                    for topic in getattr(result, "topics", [])
+                    if not getattr(topic, "closed", False)
+                    and not getattr(topic, "hidden", False)
+                ]
+            except Exception as exc:
+                log.warning("could not list forum topics for %s: %s", entity, exc)
+
+            # Fallback for older Telegram responses/permissions.
             messages = await client.get_messages(entity, limit=100)
             ids: list[int] = []
             for item in messages:
