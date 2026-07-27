@@ -1068,7 +1068,14 @@ async def grp_waiting(
     extra = ""
     if link_aid:
         await mailer_db.link_account_group(int(link_aid), gid)
-        extra = f"\nПривязана к аккаунту #{link_aid}"
+        extra = f"\n\u041f\u0440\u0438\u0432\u044f\u0437\u0430\u043d\u0430 \u043a \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0443 #{link_aid}"
+    else:
+        accounts = await mailer_db.list_accounts()
+        active_accounts = [account for account in accounts if account["status"] in ("active", "cooldown")]
+        for account in active_accounts:
+            await mailer_db.link_account_group(int(account["id"]), gid)
+        pause = await mailer_db.get_int("join_pause_sec", 300)
+        extra = f"\n\u041f\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u0430 \u0432 \u043e\u0447\u0435\u0440\u0435\u0434\u044c \u0434\u043b\u044f {len(active_accounts)} \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432. \u041f\u0430\u0443\u0437\u0430: {pause // 60} \u043c\u0438\u043d."
     await state.clear()
     await message.answer(
         f"✅ Группа добавлена\n"
