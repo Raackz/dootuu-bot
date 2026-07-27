@@ -198,6 +198,21 @@ class MailerDB:
                     )
             await self.db.commit()
 
+        # Legacy/global pool groups may have been added after account_groups
+        # already contained some links. Attach only completely unlinked groups.
+        # Existing account-specific links remain unchanged.
+        await self.db.execute(
+            "INSERT OR IGNORE INTO account_groups (account_id, group_id) "
+            "SELECT a.id, g.id FROM accounts a CROSS JOIN groups g "
+            "WHERE a.status NOT IN ('disabled', 'error', 'expired') "
+            "AND g.active = 1 "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM account_groups existing "
+            "WHERE existing.group_id = g.id"
+            ")"
+        )
+        await self.db.commit()
+
         # if no account_log_groups, attach all log_groups to all accounts
         cur = await self.db.execute("SELECT COUNT(*) AS c FROM account_log_groups")
         row = await cur.fetchone()
