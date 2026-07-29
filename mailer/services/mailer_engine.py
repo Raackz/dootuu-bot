@@ -52,6 +52,7 @@ class MailerEngine:
         self._group_rr: dict[int, int] = {}  # account_id -> rr index
         self._account_rr: int = 0
         self._empty_text_warned: set[int] = set()
+        self._next_join_at: float = 0.0
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -92,7 +93,13 @@ class MailerEngine:
                 tick_started = time.monotonic()
                 did_work, delay = await self._tick()
                 elapsed = time.monotonic() - tick_started
-                await asyncio.sleep(join_delay if join_work else (max(0.0, delay - elapsed) if did_work else 3.0))
+                # A pending join queue must not replace the configured message delay.
+                # Otherwise join_pause_sec (often 300s) makes sends appear every 5–6 min.
+                await asyncio.sleep(
+                    max(0.0, delay - elapsed)
+                    if did_work
+                    else (join_delay if join_work else 3.0)
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -102,6 +109,8 @@ class MailerEngine:
     async def _process_one_join(self) -> tuple[bool, float]:
         """Join one linked target at a time and persist the next attempt."""
         now = time.time()
+        if now < self._next_join_at:
+            return False, self._next_join_at - now
         queue = await self.db.list_group_join_queue(now, limit=1)
         if not queue:
             return False, 0.0
@@ -111,6 +120,8 @@ class MailerEngine:
         ref = (item.get("group_username") or "").strip() or str(item["chat_id"])
         result = await self.telethon.join_group(account_id, ref)
         pause = max(30, await self.db.get_int("join_pause_sec", 60))
+        # Joining has its own rate limit, but must not throttle message sending.
+        self._next_join_at = now + pause
         if result.get("ok"):
             await self.db.record_group_join(account_id, group_id, status="joined")
             log.info("account=%s joined group=%s", account_id, group_id)
@@ -343,20 +354,14 @@ class MailerEngine:
         extra: str | None,
         cycle_limit: int,
     ) -> None:
-        label = account.get("label") or account.get("phone") or "?"
         gtitle = group.get("title") or group.get("chat_id")
-        sent = int(account.get("sent_in_cycle") or 0)
-        text = (
-            f"{status}\n"
-            f"Account: <b>{_esc(label)}</b>\n"
-            f"{self._client_line(account)}"
-            f"Group: <b>{_esc(str(gtitle))}</b>\n"
-            f"Chat ID: <code>{group.get('chat_id')}</code>\n"
-            f"Cycle progress: <b>{sent}/{cycle_limit}</b>\n"
-            f"Text: {_esc(preview)}"
-        )
         if extra:
-            text += f"\nError: <code>{_esc(extra)}</code>"
+            text = (
+                f"❌ Failed to send to {_esc(str(gtitle))}\n"
+                f"Error: {_esc(str(extra))}"
+            )
+        else:
+            text = f"✅ Successfully forwarded to: {_esc(str(gtitle))}"
         await self._notify_account(account["id"], text)
 
     async def _notify_account_duration_ended(self, account: dict) -> None:
