@@ -284,6 +284,21 @@ class TelethonManager:
         except Exception as exc:
             log.warning("could not create forum topic for %s: %s", entity, exc)
             return None
+    async def _get_entity_for_chat(self, client: TelegramClient, chat_id: int) -> Any:
+        """Resolve legacy and canonical Telegram channel IDs."""
+        candidates = [int(chat_id)]
+        # Older records may contain the bare channel ID instead of -100<ID>.
+        if int(chat_id) > 0:
+            candidates.append(int(f"-100{int(chat_id)}"))
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                return await client.get_entity(candidate)
+            except Exception as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
     async def send_to_group(
         self,
         account_id: int,
@@ -295,12 +310,12 @@ class TelethonManager:
         """Send a text or forward a source message as account into a group."""
         client = await self.get_client(account_id)
         try:
-            entity = await client.get_entity(chat_id)
+            entity = await self._get_entity_for_chat(client, chat_id)
             source_peer = source_chat_id
             if source_chat_id is not None and source_message_id is not None:
                 try:
-                    source_peer = await client.get_entity(source_chat_id)
-                except (TypeError, ValueError) as exc:
+                    source_peer = await self._get_entity_for_chat(client, source_chat_id)
+                except Exception as exc:
                     # The account cannot resolve the source chat. Fall back to
                     # the HTML representation so custom emoji are retained.
                     log.warning("source chat unavailable for account=%s chat=%s: %s", account_id, source_chat_id, exc)
@@ -374,8 +389,10 @@ class TelethonManager:
                 await client(ImportChatInviteRequest(invite_hash))
                 return {"ok": True, "already": False}
 
-            entity_ref: Any = int(ref) if re.fullmatch(r"-?\d+", ref) else ref.lstrip("@")
-            entity = await client.get_entity(entity_ref)
+            if re.fullmatch(r"-?\d+", ref):
+                entity = await self._get_entity_for_chat(client, int(ref))
+            else:
+                entity = await client.get_entity(ref.lstrip("@"))
             if isinstance(entity, User):
                 return {"ok": False, "permanent": True, "error": "target is a user"}
             if isinstance(entity, Channel):

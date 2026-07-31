@@ -53,6 +53,7 @@ class MailerEngine:
         self._account_rr: int = 0
         self._empty_text_warned: set[int] = set()
         self._next_join_at: float = 0.0
+        self._blocked_pairs: set[tuple[int, int]] = set()
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -182,7 +183,10 @@ class MailerEngine:
             message = await self.db.account_message(acc)
             text = (message.get("text") or "").strip()
             has_source = bool(message.get("source_chat_id") and message.get("source_message_id"))
-            groups = await self.db.list_account_groups(acc["id"], only_active=True)
+            groups = [
+                g for g in await self.db.list_account_groups(acc["id"], only_active=True)
+                if (int(acc["id"]), int(g["id"])) not in self._blocked_pairs
+            ]
             if not groups:
                 continue
             if not text and not has_source:
@@ -203,7 +207,10 @@ class MailerEngine:
         self._account_rr = (idx + 1) % max(len(ready), 1)
 
         # only THIS account's groups
-        groups = await self.db.list_account_groups(account["id"], only_active=True)
+        groups = [
+            g for g in await self.db.list_account_groups(account["id"], only_active=True)
+            if (int(account["id"]), int(g["id"])) not in self._blocked_pairs
+        ]
         if not groups:
             return False, 3.0
 
@@ -272,15 +279,16 @@ class MailerEngine:
             )
             return True, delay
         elif result.get("write_forbidden"):
-            # Write restrictions are target-specific; stop this pair from retrying forever.
-            await self.db.unlink_account_group(account["id"], group["id"])
+            # Keep the DB link intact. Block only this account/group pair in memory;
+            # the group must not disappear from the user's configured groups.
+            self._blocked_pairs.add((int(account["id"]), int(group["id"])))
             await self._notify_account(
                 account["id"],
                 "⚠️ <b>Target disabled for this account</b>\n"
                 f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
                 f"Group: <b>{_esc(str(group.get('title') or group.get('chat_id')))}</b>\n"
-                "Telegram says this account cannot write there. The account was kept; "
-                "grant it permission or link the group to another account.",
+                "Telegram says this account cannot write there. The group link was kept; "
+                "grant permission or link the group to another account.",
             )
             await self.db.set_account_status(account["id"], "active", error=err)
         elif flood:
