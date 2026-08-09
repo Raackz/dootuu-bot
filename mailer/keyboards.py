@@ -164,6 +164,12 @@ def account_groups_menu(
             callback_data=f"acc:grpadd:{account_id}",
         )
     )
+    b.row(
+        InlineKeyboardButton(
+            text="Включить все группы",
+            callback_data=f"acc:grpall:{account_id}",
+        )
+    )
     for g in all_groups:
         on = g["id"] in linked_ids
         mark = "✅" if on else "☐"

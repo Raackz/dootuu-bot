@@ -1859,6 +1859,24 @@ async def acc_grps(
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("acc:grpall:"))
+async def acc_grp_all(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    groups = await mailer_db.list_groups()
+    for group in groups:
+        await mailer_db.link_account_group(aid, int(group["id"]))
+    await call.answer(f"Включено групп: {len(groups)}")
+    call.data = f"acc:grps:{aid}"
+    await acc_grps(call, mailer_config, mailer_db)
+
+
 @router.callback_query(F.data.startswith("acc:grptog:"))
 async def acc_grp_tog(
     call: CallbackQuery,
