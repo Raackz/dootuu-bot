@@ -53,7 +53,6 @@ class MailerEngine:
         self._account_rr: int = 0
         self._empty_text_warned: set[int] = set()
         self._next_join_at: float = 0.0
-        self._blocked_pairs: set[tuple[int, int]] = set()
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -183,10 +182,7 @@ class MailerEngine:
             message = await self.db.account_message(acc)
             text = (message.get("text") or "").strip()
             has_source = bool(message.get("source_chat_id") and message.get("source_message_id"))
-            groups = [
-                g for g in await self.db.list_account_groups(acc["id"], only_active=True)
-                if (int(acc["id"]), int(g["id"])) not in self._blocked_pairs
-            ]
+            groups = await self.db.list_account_sendable_groups(acc["id"])
             if not groups:
                 continue
             if not text and not has_source:
@@ -207,10 +203,7 @@ class MailerEngine:
         self._account_rr = (idx + 1) % max(len(ready), 1)
 
         # only THIS account's groups
-        groups = [
-            g for g in await self.db.list_account_groups(account["id"], only_active=True)
-            if (int(account["id"]), int(g["id"])) not in self._blocked_pairs
-        ]
+        groups = await self.db.list_account_sendable_groups(account["id"])
         if not groups:
             return False, 3.0
 
@@ -250,6 +243,7 @@ class MailerEngine:
                 preview=preview,
                 extra=None,
                 cycle_limit=cycle_limit,
+                forwarded=bool(source_chat_id and source_message_id),
             )
             if (updated or {}).get("status") == "cooldown":
                 await self._notify_cycle_finished(updated or account)
@@ -279,18 +273,42 @@ class MailerEngine:
             )
             return True, delay
         elif result.get("write_forbidden"):
-            # Keep the DB link intact. Block only this account/group pair in memory;
-            # the group must not disappear from the user's configured groups.
-            self._blocked_pairs.add((int(account["id"]), int(group["id"])))
+            await self.db.block_account_group_send(
+                account["id"],
+                group["id"],
+                err,
+                account_restriction=bool(result.get("user_banned")),
+            )
+            if result.get("user_banned"):
+                threshold = max(2, await self.db.get_int("write_block_threshold", 3))
+                recent = await self.db.count_account_send_blocks(
+                    account["id"],
+                    since=time.time() - 15 * 60,
+                    account_restriction_only=True,
+                )
+                if recent >= threshold:
+                    await self.db.set_account_status(account["id"], "error", error=err)
+                    await self._notify_account(
+                        account["id"],
+                        "⛔ <b>Account stopped: Telegram write restriction</b>\n"
+                        f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
+                        f"Failed in <b>{recent}</b> different groups within 15 minutes.\n"
+                        "The account was stopped to avoid repeated failed requests. "
+                        "Check it with @SpamBot and try a manual message. After the "
+                        "restriction is removed, reset target blocks in the account card.",
+                    )
+                    return True, delay
+            await self.db.set_account_status(account["id"], "active", error=err)
             await self._notify_account(
                 account["id"],
                 "⚠️ <b>Target disabled for this account</b>\n"
                 f"Account: <b>{_esc(account.get('label') or account.get('phone') or '?')}</b>\n"
                 f"Group: <b>{_esc(str(group.get('title') or group.get('chat_id')))}</b>\n"
-                "Telegram says this account cannot write there. The group link was kept; "
-                "grant permission or link the group to another account.",
+                f"Reason: <code>{_esc(err)}</code>\n"
+                "The target remains linked but will not be retried after restart. "
+                "Reset target blocks after restoring write permission.",
             )
-            await self.db.set_account_status(account["id"], "active", error=err)
+            return True, delay
         elif flood:
             await self.db.db.execute(
                 "UPDATE accounts SET status = 'cooldown', next_cycle_at = ?, last_error = ? WHERE id = ?",
@@ -315,6 +333,7 @@ class MailerEngine:
             preview=preview,
             extra=err,
             cycle_limit=cycle_limit,
+            forwarded=bool(source_chat_id and source_message_id),
         )
         return True, delay
 
@@ -361,6 +380,7 @@ class MailerEngine:
         preview: str,
         extra: str | None,
         cycle_limit: int,
+        forwarded: bool,
     ) -> None:
         gtitle = group.get("title") or group.get("chat_id")
         if extra:
@@ -369,7 +389,8 @@ class MailerEngine:
                 f"Error: {_esc(str(extra))}"
             )
         else:
-            text = f"✅ Successfully forwarded to: {_esc(str(gtitle))}"
+            action = "forwarded" if forwarded else "sent"
+            text = f"✅ Successfully {action} to: {_esc(str(gtitle))}"
         await self._notify_account(account["id"], text)
 
     async def _notify_account_duration_ended(self, account: dict) -> None:

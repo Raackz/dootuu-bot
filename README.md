@@ -20,8 +20,9 @@
 | `ADMIN_IDS` | твой числовой id |
 | `ADMIN_USERNAMES` | или username без @ |
 | `TG_API_ID` / `TG_API_HASH` | https://my.telegram.org |
+| `DATA_DIR` | каталог для SQLite, Telegram-сессий и логов |
 
-## Локально
+## Установка и запуск
 
 ```bash
 python -m venv .venv
@@ -32,12 +33,19 @@ copy .env.example .env
 python -m mailer
 ```
 
-## Railway
+На Linux команды активации и копирования отличаются:
 
-- Start command: `python -m mailer`
-- Volume (желательно): `/app/data` — чтобы sessions не слетали
+```bash
+source .venv/bin/activate
+cp .env.example .env
+```
 
+Для постоянной работы на сервере процесс `python -m mailer` можно запустить через
+systemd, supervisor или другой менеджер процессов.
 
-## Persistence
+## Хранение данных
 
-On Railway, attach a persistent Volume mounted at /app/data and set DATA_DIR=/app/data/mailer. SQLite and Telethon sessions are stored there; without the Volume a redeploy starts with an empty database. The account menu supports multiple linked target groups and rotates through all active groups.
+SQLite, Telegram-сессии и логи хранятся в каталоге `DATA_DIR` (по умолчанию
+`./data/mailer`). Этот каталог нельзя удалять или заменять при обновлении бота,
+иначе добавленные аккаунты и настройки будут потеряны. Рекомендуется регулярно
+делать его резервную копию.

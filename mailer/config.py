@@ -32,9 +32,9 @@ class MailerConfig:
     def __post_init__(self) -> None:
         self.bot_token = (os.getenv("MAILER_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
         raw = os.getenv("MAILER_ADMIN_IDS") or os.getenv("ADMIN_IDS") or ""
-        configured_ids = [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
-        # Built-in owner/admin IDs keep access available if Railway env propagation lags.
-        self.admin_ids = sorted(set(configured_ids) | {2100696545, 8313034139, 8582617929})
+        self.admin_ids = sorted(
+            {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
+        )
         raw_names = os.getenv("MAILER_ADMIN_USERNAMES") or os.getenv("ADMIN_USERNAMES") or ""
         self.admin_usernames = [
             x.strip().lstrip("@").lower() for x in raw_names.split(",") if x.strip()
@@ -44,13 +44,7 @@ class MailerConfig:
         self.allow_all = open_raw in ("1", "true", "yes", "on")
         self.api_id = int(os.getenv("TG_API_ID") or os.getenv("API_ID") or "0")
         self.api_hash = (os.getenv("TG_API_HASH") or os.getenv("API_HASH") or "").strip()
-        # Prefer a persistent Railway Volume when configured.
-        railway_data_dir = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
-        default_data_dir = (
-            Path(railway_data_dir) / "mailer"
-            if railway_data_dir
-            else BASE_DIR / "data" / "mailer"
-        )
+        default_data_dir = BASE_DIR / "data" / "mailer"
         self.data_dir = Path(os.getenv("DATA_DIR") or default_data_dir)
         self.db_path = self.data_dir / "mailer.db"
         self.sessions_dir = self.data_dir / "sessions"

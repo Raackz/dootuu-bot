@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -21,7 +22,8 @@ from mailer.handlers import setup_routers
 from mailer.services.mailer_engine import MailerEngine
 from mailer.services.telethon_manager import TelethonManager
 
-_LOG_DIR = Path(__file__).resolve().parent.parent / "data" / "mailer"
+_DEFAULT_LOG_DIR = Path(__file__).resolve().parent.parent / "data" / "mailer"
+_LOG_DIR = Path(os.getenv("DATA_DIR") or _DEFAULT_LOG_DIR)
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,

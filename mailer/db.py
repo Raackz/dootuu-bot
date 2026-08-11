@@ -127,6 +127,15 @@ class MailerDB:
                 last_error TEXT,
                 PRIMARY KEY (account_id, group_id)
             );
+
+            CREATE TABLE IF NOT EXISTS account_group_send_blocks (
+                account_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                error TEXT,
+                account_restriction INTEGER NOT NULL DEFAULT 0,
+                blocked_at REAL NOT NULL,
+                PRIMARY KEY (account_id, group_id)
+            );
             """
         )
         await self.db.commit()
@@ -143,6 +152,11 @@ class MailerDB:
         await self._ensure_column("accounts", "mailing_ends_at", "REAL")
         await self._ensure_column("messages", "source_chat_id", "INTEGER")
         await self._ensure_column("messages", "source_message_id", "INTEGER")
+        await self._ensure_column(
+            "account_group_send_blocks",
+            "account_restriction",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         # seed defaults
         defaults = {
             "mailing_enabled": "0",
@@ -153,6 +167,7 @@ class MailerDB:
             "cycle_pause_sec": "3600",
             "delay_sec": "8",
             "join_pause_sec": "60",
+            "write_block_threshold": "3",
             "active_message_id": "",
         }
         for k, v in defaults.items():
@@ -400,6 +415,9 @@ class MailerDB:
 
     async def delete_account(self, account_id: int) -> None:
         await self.db.execute("DELETE FROM account_groups WHERE account_id = ?", (account_id,))
+        await self.db.execute(
+            "DELETE FROM account_group_send_blocks WHERE account_id = ?", (account_id,)
+        )
         await self.db.execute("DELETE FROM account_log_groups WHERE account_id = ?", (account_id,))
         await self.db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         await self.db.commit()
@@ -627,6 +645,9 @@ class MailerDB:
         await self.db.commit()
 
     async def delete_group(self, group_id: int) -> None:
+        await self.db.execute(
+            "DELETE FROM account_group_send_blocks WHERE group_id = ?", (group_id,)
+        )
         await self.db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         await self.db.commit()
 
@@ -651,6 +672,64 @@ class MailerDB:
         cur = await self.db.execute(q, (account_id,))
         return [dict(r) for r in await cur.fetchall()]
 
+    async def list_account_sendable_groups(self, account_id: int) -> list[dict[str, Any]]:
+        """Active linked targets not persistently blocked for this account."""
+        cur = await self.db.execute(
+            "SELECT g.* FROM groups g "
+            "INNER JOIN account_groups ag ON ag.group_id = g.id "
+            "LEFT JOIN account_group_send_blocks b "
+            "ON b.account_id = ag.account_id AND b.group_id = ag.group_id "
+            "WHERE ag.account_id = ? AND g.active = 1 AND b.group_id IS NULL "
+            "ORDER BY g.id",
+            (account_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def block_account_group_send(
+        self, account_id: int, group_id: int, error: str, *, account_restriction: bool = False
+    ) -> None:
+        await self.db.execute(
+            "INSERT INTO account_group_send_blocks "
+            "(account_id, group_id, error, account_restriction, blocked_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(account_id, group_id) DO UPDATE SET "
+            "error=excluded.error, account_restriction=excluded.account_restriction, "
+            "blocked_at=excluded.blocked_at",
+            (
+                account_id,
+                group_id,
+                (error or "")[:500],
+                1 if account_restriction else 0,
+                time.time(),
+            ),
+        )
+        await self.db.commit()
+
+    async def count_account_send_blocks(
+        self,
+        account_id: int,
+        *,
+        since: float | None = None,
+        account_restriction_only: bool = False,
+    ) -> int:
+        q = "SELECT COUNT(*) FROM account_group_send_blocks WHERE account_id = ?"
+        params: list[Any] = [account_id]
+        if account_restriction_only:
+            q += " AND account_restriction = 1"
+        if since is not None:
+            q += " AND blocked_at >= ?"
+            params.append(float(since))
+        cur = await self.db.execute(q, params)
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def clear_account_send_blocks(self, account_id: int) -> int:
+        cur = await self.db.execute(
+            "DELETE FROM account_group_send_blocks WHERE account_id = ?", (account_id,)
+        )
+        await self.db.commit()
+        return max(0, int(cur.rowcount or 0))
+
     async def link_account_group(self, account_id: int, group_id: int) -> None:
         await self.db.execute(
             "INSERT OR IGNORE INTO account_groups (account_id, group_id) VALUES (?, ?)",
@@ -661,6 +740,10 @@ class MailerDB:
     async def unlink_account_group(self, account_id: int, group_id: int) -> None:
         await self.db.execute(
             "DELETE FROM account_groups WHERE account_id = ? AND group_id = ?",
+            (account_id, group_id),
+        )
+        await self.db.execute(
+            "DELETE FROM account_group_send_blocks WHERE account_id = ? AND group_id = ?",
             (account_id, group_id),
         )
         await self.db.commit()

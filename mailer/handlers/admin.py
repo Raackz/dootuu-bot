@@ -6,9 +6,11 @@ import logging
 import time
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
+from aiogram.filters.exception import ExceptionTypeFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ErrorEvent, Message
 
 from mailer.config import MailerConfig
 from mailer.db import MailerDB
@@ -28,6 +30,14 @@ from mailer.states import (
 
 log = logging.getLogger(__name__)
 router = Router(name="mailer_admin")
+
+
+@router.errors(ExceptionTypeFilter(TelegramBadRequest))
+async def ignore_unchanged_message(event: ErrorEvent) -> bool:
+    """Repeated menu clicks are harmless and should not produce tracebacks."""
+    if "message is not modified" in str(event.exception).lower():
+        return True
+    raise event.exception
 
 
 async def _is_allowed(
@@ -105,6 +115,21 @@ def _source_message_ref(message: Message) -> tuple[int | None, int | None]:
     if source_chat_id is None or source_message_id is None:
         return None, None
     return int(source_chat_id), int(source_message_id)
+
+
+async def _reject_unresolvable_forward(
+    message: Message, source_chat_id: int | None
+) -> bool:
+    """Do not silently turn an unsupported Telegram forward into plain text."""
+    if getattr(message, "forward_origin", None) is None or source_chat_id is not None:
+        return False
+    await message.answer(
+        "Не удалось получить ID исходного сообщения, поэтому native forward невозможен.\n\n"
+        "Перешли пост из канала с видимым источником. Пересылки из личных чатов, "
+        "некоторых групп, со скрытым автором или защищённым содержимым Telegram "
+        "передаёт без ID исходного сообщения."
+    )
+    return True
 
 async def _main_text(db: MailerDB, config: MailerConfig | None = None) -> str:
     st = await db.stats()
@@ -465,8 +490,10 @@ async def acc_phone(
     await message.answer(
         f"{status}\n\n"
         f"<b>Шаг 2/3 — код</b>\n"
-        f"Открой заказ на LZT → по ключу возьми код (или SMS/Telegram) → "
-        f"пришли сюда <b>только цифры кода</b>.",
+        f"Открой заказ на LZT → по ключу возьми новый код (или SMS/Telegram).\n\n"
+        f"⚠️ <b>Не отправляй цифры слитно:</b> Telegram сразу аннулирует такой код.\n"
+        f"Раздели цифры любыми символами, например: "
+        f"<code>1 2 3 4 5</code> или <code>1-2-3-4-5</code>.",
         reply_markup=kb.cancel_kb(),
         parse_mode="HTML",
     )
@@ -483,9 +510,23 @@ async def acc_code(
     if not await _is_allowed(message, mailer_config, mailer_db):
         await _deny(message)
         return
+    raw_code = (message.text or "").strip()
+    if raw_code.isdigit():
+        # Telegram invalidates login codes posted verbatim inside Telegram.
+        # This code is already unusable by the time the bot receives it.
+        await mailer_telethon.cancel_pending(message.from_user.id)
+        await state.clear()
+        await message.answer(
+            "Этот код был отправлен слитно, поэтому Telegram уже аннулировал его.\n\n"
+            "Начни добавление аккаунта заново, получи <b>новый</b> код и пришли "
+            "его с любыми разделителями, например: <code>1 2 3 4 5</code>.",
+            reply_markup=kb.back_main(),
+            parse_mode="HTML",
+        )
+        return
     try:
         text, need_pw = await mailer_telethon.confirm_code(
-            message.from_user.id, message.text or ""
+            message.from_user.id, raw_code
         )
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
@@ -547,6 +588,7 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
     if not preview:
         preview = "— не задано —"
     grps = await mailer_db.list_account_groups(acc["id"], only_active=True)
+    blocked = await mailer_db.count_account_send_blocks(acc["id"])
     logs = await mailer_db.list_account_log_groups(acc["id"])
     client = (acc.get("client_label") or "").strip() or "—"
     return (
@@ -556,7 +598,8 @@ async def _fmt_acc_params(mailer_db: MailerDB, acc: dict) -> str:
         f"Телефон: <code>{acc['phone']}</code>\n"
         f"Статус: <code>{acc['status']}</code>\n"
         f"В круге: {acc.get('sent_in_cycle') or 0}/{limit}\n"
-        f"Групп рассылки: <b>{len(grps)}</b> · лог-групп: <b>{len(logs)}</b>\n"
+        f"Групп рассылки: <b>{len(grps)}</b> · заблокировано: <b>{blocked}</b> "
+        f"· лог-групп: <b>{len(logs)}</b>\n"
         f"Ошибка: {acc.get('last_error') or '—'}\n\n"
         f"<b>Сообщение</b> ({'своё' if own_msg else 'глобальный шаблон'}):\n"
         f"<code>{_html_esc(preview)}</code>\n\n"
@@ -682,6 +725,8 @@ async def acc_msg_edit_text(
     aid = int(data["account_id"])
     text = _message_content(message)
     source_chat_id, source_message_id = _source_message_ref(message)
+    if await _reject_unresolvable_forward(message, source_chat_id):
+        return
     if not text.strip() and source_chat_id is None:
         await message.answer("Пришли текст или перешли исходное сообщение")
         return
@@ -946,6 +991,25 @@ async def acc_enable(
     aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
     await mailer_db.set_account_status(aid, "active", error=None)
     await call.answer("Включён")
+    call.data = f"acc:view:{aid}"
+    await acc_view(call, mailer_config, mailer_db)
+
+
+@router.callback_query(F.data.startswith("acc:resetblocks:"))
+async def acc_reset_blocks(
+    call: CallbackQuery,
+    mailer_config: MailerConfig,
+    mailer_db: MailerDB,
+) -> None:
+    if not await _is_allowed(call, mailer_config, mailer_db):
+        await _deny(call)
+        return
+    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
+    cleared = await mailer_db.clear_account_send_blocks(aid)
+    acc = await mailer_db.get_account(aid)
+    if acc and acc.get("status") == "error":
+        await mailer_db.set_account_status(aid, "active", error=None)
+    await call.answer(f"Сброшено блокировок: {cleared}")
     call.data = f"acc:view:{aid}"
     await acc_view(call, mailer_config, mailer_db)
 
@@ -1285,6 +1349,8 @@ async def msg_edit_text(
     mid = int(data["message_id"])
     text = _message_content(message)
     source_chat_id, source_message_id = _source_message_ref(message)
+    if await _reject_unresolvable_forward(message, source_chat_id):
+        return
     if not text.strip() and source_chat_id is None:
         await message.answer("Пришли текст или перешли исходное сообщение")
         return
@@ -1357,6 +1423,8 @@ async def msg_new_text(
     data = await state.get_data()
     text = _message_content(message)
     source_chat_id, source_message_id = _source_message_ref(message)
+    if await _reject_unresolvable_forward(message, source_chat_id):
+        return
     if not text.strip() and source_chat_id is None:
         await message.answer("Пришли текст или перешли исходное сообщение")
         return
@@ -1859,24 +1927,6 @@ async def acc_grps(
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("acc:grpall:"))
-async def acc_grp_all(
-    call: CallbackQuery,
-    mailer_config: MailerConfig,
-    mailer_db: MailerDB,
-) -> None:
-    if not await _is_allowed(call, mailer_config, mailer_db):
-        await _deny(call)
-        return
-    aid = int(call.data.split(":")[-1])  # type: ignore[union-attr]
-    groups = await mailer_db.list_groups()
-    for group in groups:
-        await mailer_db.link_account_group(aid, int(group["id"]))
-    await call.answer(f"Включено групп: {len(groups)}")
-    call.data = f"acc:grps:{aid}"
-    await acc_grps(call, mailer_config, mailer_db)
-
-
 @router.callback_query(F.data.startswith("acc:grptog:"))
 async def acc_grp_tog(
     call: CallbackQuery,
@@ -2102,7 +2152,7 @@ async def _api_status_text(mailer_db: MailerDB, mailer_config: MailerConfig) -> 
     ready = mailer_config.telethon_ready
     hid = str(mailer_config.api_id) if mailer_config.api_id else "—"
     hh = (mailer_config.api_hash[:6] + "…" + mailer_config.api_hash[-4:]) if mailer_config.api_hash and len(mailer_config.api_hash) > 12 else (mailer_config.api_hash or "—")
-    src = "БД (через бота)" if db_id and db_hash else ("env/Railway" if ready else "не задано")
+    src = "БД (через бота)" if db_id and db_hash else ("переменные окружения" if ready else "не задано")
     return (
         f"<b>🔑 API Telegram (Telethon)</b>\n\n"
         f"Статус: <b>{'✅ готово' if ready else '❌ не задано'}</b>\n"

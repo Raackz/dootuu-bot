@@ -143,7 +143,13 @@ def account_card(account_id: int, status: str) -> InlineKeyboardMarkup:
             callback_data=f"acc:params:{account_id}",
         )
     )
-    if status in ("disabled", "expired"):
+    b.row(
+        InlineKeyboardButton(
+            text="♻️ Сбросить блокировки групп",
+            callback_data=f"acc:resetblocks:{account_id}",
+        )
+    )
+    if status in ("disabled", "expired", "error"):
         b.row(InlineKeyboardButton(text="Включить", callback_data=f"acc:enable:{account_id}"))
     else:
         b.row(InlineKeyboardButton(text="Выключить", callback_data=f"acc:disable:{account_id}"))
@@ -162,12 +168,6 @@ def account_groups_menu(
         InlineKeyboardButton(
             text="➕ Добавить новую группу сюда",
             callback_data=f"acc:grpadd:{account_id}",
-        )
-    )
-    b.row(
-        InlineKeyboardButton(
-            text="Включить все группы",
-            callback_data=f"acc:grpall:{account_id}",
         )
     )
     for g in all_groups:

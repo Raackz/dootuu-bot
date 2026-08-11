@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient
+from telethon.helpers import generate_random_long
 from telethon.errors import (
     BadRequestError,
     ChatAdminRequiredError,
@@ -74,13 +75,24 @@ class TelethonManager:
 
     async def start_login(self, admin_id: int, phone: str) -> str:
         """Send login code. Returns human status."""
-        api_id, api_hash = await self._load_api()
         phone = phone.strip().replace(" ", "")
         if not phone.startswith("+"):
             phone = "+" + phone
 
         # cancel previous pending for this admin
         await self.cancel_pending(admin_id)
+
+        existing = await self.db.get_account_by_phone(phone)
+        if existing and existing.get("status") in ("active", "cooldown"):
+            raise RuntimeError(
+                "Этот аккаунт уже добавлен. Открой его карточку в меню «Аккаунты»."
+            )
+        if existing:
+            # An errored/expired account may be authorized again, but its old
+            # pooled client must release the SQLite session first.
+            await self.disconnect_account(int(existing["id"]))
+
+        api_id, api_hash = await self._load_api()
 
         session_name = _safe_session_name(phone)
         client = TelegramClient(
@@ -102,7 +114,14 @@ class TelethonManager:
         if not pending:
             raise RuntimeError("Нет активного входа. Начни заново: добавь аккаунт.")
 
-        code = code.strip().replace(" ", "").replace("-", "")
+        # Telegram invalidates a login code sent verbatim in a Telegram
+        # message. Accept any separators and keep only the digits.
+        code = re.sub(r"\D+", "", code)
+        if not code.isdigit():
+            raise RuntimeError(
+                "Код должен содержать цифры с разделителями, "
+                "например: 1 2 3 4 5"
+            )
         try:
             await pending.client.sign_in(
                 phone=pending.phone,
@@ -214,7 +233,7 @@ class TelethonManager:
 
     async def _send_in_forum_topic(
         self, client: TelegramClient, entity: Any, text: str,
-        source_chat_id: int | None = None, source_message_id: int | None = None,
+        source_peer: Any | None = None, source_message_id: int | None = None,
     ):
         """Send to an open forum topic, creating one when needed."""
         async def topic_ids() -> list[int]:
@@ -254,10 +273,11 @@ class TelethonManager:
         async def try_topics(ids: list[int]):
             for topic_id in ids:
                 try:
-                    if source_chat_id is not None and source_message_id is not None:
+                    if source_peer is not None and source_message_id is not None:
                         updates = await client(ForwardMessagesRequest(
-                            from_peer=source_chat_id, id=[source_message_id],
+                            from_peer=source_peer, id=[source_message_id],
                             to_peer=entity, top_msg_id=topic_id,
+                            random_id=[generate_random_long()],
                         ))
                         for update in getattr(updates, "updates", []):
                             forwarded = getattr(update, "message", None)
@@ -311,18 +331,25 @@ class TelethonManager:
         client = await self.get_client(account_id)
         try:
             entity = await self._get_entity_for_chat(client, chat_id)
-            source_peer = source_chat_id
+            source_peer: Any | None = None
             if source_chat_id is not None and source_message_id is not None:
                 try:
                     source_peer = await self._get_entity_for_chat(client, source_chat_id)
                 except Exception as exc:
-                    # The account cannot resolve the source chat. Fall back to
-                    # the HTML representation so custom emoji are retained.
                     log.warning("source chat unavailable for account=%s chat=%s: %s", account_id, source_chat_id, exc)
-                    source_chat_id = None
-                    source_message_id = None
+                    # A text/caption can still be delivered, but a media-only
+                    # forward must not turn into send_message("").
+                    if not text.strip():
+                        return {
+                            "ok": False,
+                            "error": (
+                                "Source message is unavailable to this account. "
+                                "Add the account to the source chat/channel and try again."
+                            ),
+                            "source_unavailable": True,
+                        }
             try:
-                if source_chat_id is not None and source_message_id is not None:
+                if source_peer is not None and source_message_id is not None:
                     forwarded = await client.forward_messages(
                         entity, source_message_id, from_peer=source_peer
                     )
@@ -333,7 +360,7 @@ class TelethonManager:
                 if "TOPIC_CLOSED" not in str(exc):
                     raise
                 msg = await self._send_in_forum_topic(
-                    client, entity, text, source_chat_id, source_message_id
+                    client, entity, text, source_peer, source_message_id
                 )
                 if msg is None:
                     raise
@@ -346,12 +373,18 @@ class TelethonManager:
             }
         except FloodWaitError as e:
             return {"ok": False, "error": f"FloodWait {e.seconds}s", "flood_wait": e.seconds}
+        except UserBannedInChannelError as e:
+            return {
+                "ok": False,
+                "error": str(e),
+                "write_forbidden": True,
+                "user_banned": True,
+            }
         except (
             ChatWriteForbiddenError,
             ChatAdminRequiredError,
             ChatForbiddenError,
             ChannelPrivateError,
-            UserBannedInChannelError,
         ) as e:
             # Telegram rejected this account for this target; retrying every
             # cycle only creates a permanent failure loop.
@@ -373,7 +406,12 @@ class TelethonManager:
             if "TOPIC_CLOSED" in error:
                 return {"ok": False, "error": error, "topic_closed": True}
             if any(marker in error for marker in permanent_markers):
-                return {"ok": False, "error": error, "write_forbidden": True}
+                return {
+                    "ok": False,
+                    "error": error,
+                    "write_forbidden": True,
+                    "user_banned": "USER_BANNED_IN_CHANNEL" in error,
+                }
             return {"ok": False, "error": error}
         except Exception as e:
             log.exception("send_to_group failed account=%s chat=%s", account_id, chat_id)
